@@ -53,6 +53,15 @@ class ProtocolDecoderTests(unittest.TestCase):
             {"t": "Запись", "n": "Position"},
         )
 
+    def test_builds_initial_position_as_nullable_string(self) -> None:
+        payload = _buildPayload(100451, None)
+
+        self.assertIsNone(payload["params"]["Навигация"]["d"][3])
+        self.assertEqual(
+            payload["params"]["Навигация"]["s"][3],
+            {"t": "Строка", "n": "Position"},
+        )
+
     def test_builds_read_card_payload(self) -> None:
         payload = _buildReadCardPayload("500100732259")
 
@@ -351,7 +360,7 @@ class GetClientsByListIdTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_page.await_count, 2)
         self.assertEqual(get_page.await_args_list[0].args[2], "sid=test-session")
 
-    async def test_rejects_page_without_required_cursor(self) -> None:
+    async def test_stops_when_full_page_has_no_next_position(self) -> None:
         session = Mock()
         session.__aenter__ = AsyncMock(return_value=session)
         session.__aexit__ = AsyncMock(return_value=None)
@@ -374,8 +383,9 @@ class GetClientsByListIdTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=([{}] * PAGE_SIZE, True, None)),
             ),
         ):
-            with self.assertRaises(SbisApiError):
-                await getClientsByListId(100451)
+            result = await getClientsByListId(100451)
+
+        self.assertEqual(result, [{}] * PAGE_SIZE)
 
     async def test_accepts_short_last_page_when_has_more_is_stale(self) -> None:
         session = Mock()

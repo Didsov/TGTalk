@@ -150,6 +150,7 @@ def _buildPayload(
     position: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Собрать запрос CrmClients.ListClients по зафиксированному контракту."""
+    position_type = "Строка" if position is None else "Запись"
     return {
         "jsonrpc": "2.0",
         "protocol": 7,
@@ -189,7 +190,7 @@ def _buildPayload(
                     {"t": "Строка", "n": "Direction"},
                     {"t": "Логическое", "n": "HasMore"},
                     {"t": "Число целое", "n": "Limit"},
-                    {"t": "Запись", "n": "Position"},
+                    {"t": position_type, "n": "Position"},
                 ],
                 "_type": "record",
                 "f": 0,
@@ -446,18 +447,10 @@ async def getClientsByListId(listId: int) -> list[dict[str, Any]]:
             )
             clients.extend(page)
 
-            # У некоторых списков HasMore остается true даже на последней странице.
-            # Короткая страница без курсора означает, что продолжать пагинацию некуда.
-            if has_more is False or (
-                not next_position and len(page) < PAGE_SIZE
-            ):
+            # В Wasaby размер result.d не обязан совпадать с Limit. Продолжение
+            # определяется только флагом result.n и наличием m.nextPosition.
+            if has_more is False or not next_position:
                 return clients
-
-            if not next_position:
-                raise SbisApiError(
-                    "СБИС не вернул Position для полной страницы: "
-                    f"получено {len(page)}, Limit {PAGE_SIZE}"
-                )
             position_key = json.dumps(
                 next_position,
                 ensure_ascii=False,
