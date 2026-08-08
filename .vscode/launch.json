@@ -12,6 +12,53 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "СБИС: открытые организации за сегодня → БД",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/testParseCompany.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Telegram: один клиент с записью в БД",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.cli.telegram_enrichment",
+            "args": [
+                "--limit",
+                "1",
+                "--timeout",
+                "10",
+                "--write"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Telegram: последнее сообщение (без записи)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.cli.telegram_last_message",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Telegram: последнее сообщение (записать в БД)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.cli.telegram_last_message",
+            "args": [
+                "--write"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }

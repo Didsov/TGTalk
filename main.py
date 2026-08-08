@@ -6,8 +6,16 @@ from typing import Any
 
 import aiohttp
 
+from src.config import loadEnvironment, requireSetting
+from src.domain import is_valid_inn
 from src.integrations.sbis import getClientsByListId, getContactsByInn
 from src.integrations.sbis.clients import SbisApiError
+from src.integrations.telegram.report_downloader import download_report_text
+from src.integrations.telegram.report_parser import (
+    ParsedReport,
+    parse_report,
+    parse_report_sections,
+)
 
 
 def _oneLine(value: Any) -> str:
@@ -72,6 +80,40 @@ async def debugList(listId: int) -> list[str]:
     return inns
 
 
+async def parseBotReportUrl(reportUrl: str) -> ParsedReport:
+    """Скачать TXT по ссылке бота и преобразовать его в ParsedReport."""
+    report_text = await download_report_text(reportUrl)
+    source_inn = _reportSourceInn(report_text)
+    return parse_report(report_text, source_inn=source_inn)
+
+
+def _reportSourceInn(reportText: str) -> str:
+    """Найти корректный ИНН в общей сводке TXT-отчёта."""
+    sections = parse_report_sections(reportText)
+    ordered_sections = sorted(
+        sections,
+        key=lambda section: section.title.casefold() != "общая сводка",
+    )
+    for section in ordered_sections:
+        for value in section.values("ИНН"):
+            inn = value.strip()
+            if is_valid_inn(inn):
+                return inn
+    raise ValueError("В отчёте бота не найден корректный ИНН")
+
+
+def _printReportResult(report: ParsedReport) -> None:
+    """Вывести результат парсинга без раскрытия контактов и ФИО."""
+    selection = report.candidate_selection
+    print("Результат парсинга отчёта Telegram:")
+    print(f"  Разделов: {len(report.sections)}")
+    print(f"  Телефонов: {len(report.phones)}")
+    print(f"  Email: {len(report.emails)}")
+    print(f"  Кандидатов ФИО/дата: {len(report.person_candidates)}")
+    print(f"  Выбор кандидата: {selection.status.value}")
+    print(f"  Нужна ручная проверка: {selection.requires_manual_review}")
+
+
 def _parseArguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Получить контакты клиентов из CRM-списка СБИС",
@@ -82,9 +124,12 @@ def _parseArguments() -> argparse.Namespace:
 
 def main() -> None:
     arguments = _parseArguments()
-    asyncio.run(debugList(arguments.listId))
+    loadEnvironment()
+    report_url = requireSetting("TELEGRAM_DEBUG_REPORT_URL")
+    report = asyncio.run(parseBotReportUrl(report_url))
+    _printReportResult(report)
+   #asyncio.run(debugList(arguments.listId))
 
 
 if __name__ == "__main__":
     main()
-

@@ -3,7 +3,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import AsyncMock, patch
 
-from main import debugList
+from main import debugList, parseBotReportUrl
 
 
 class DebugListTests(unittest.IsolatedAsyncioTestCase):
@@ -57,3 +57,23 @@ class DebugListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [])
         get_contacts.assert_not_awaited()
         self.assertIn("<запрос контактов пропущен>", output.getvalue())
+
+
+class ParseBotReportUrlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_downloads_and_parses_report_using_summary_inn(self) -> None:
+        report_text = (
+            "=== Общая сводка ===\n"
+            "ИНН: 7707083893\n"
+            "Телефон: 8 (900) 111-22-33\n"
+            "Email: owner@example.test\n"
+        )
+
+        with patch(
+            "main.download_report_text",
+            new=AsyncMock(return_value=report_text),
+        ) as download:
+            result = await parseBotReportUrl("https://reports.example.test/r/id")
+
+        download.assert_awaited_once_with("https://reports.example.test/r/id")
+        self.assertEqual(result.phones, ("+79001112233",))
+        self.assertEqual(result.emails, ("owner@example.test",))

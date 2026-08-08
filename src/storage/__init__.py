@@ -6,6 +6,8 @@ from src.storage.new_clients import (
     NewClientStorage,
     ProcessingStatus,
     STATUS_LABELS,
+    TelegramClaimError,
+    TelegramSearchAttempt,
 )
 
 __all__ = [
@@ -15,4 +17,6 @@ __all__ = [
     "OrganizationStorage",
     "ProcessingStatus",
     "STATUS_LABELS",
+    "TelegramClaimError",
+    "TelegramSearchAttempt",
 ]

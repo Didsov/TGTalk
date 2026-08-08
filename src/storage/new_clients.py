@@ -18,6 +18,11 @@ class ProcessingStatus(StrEnum):
     QUEUED = "queued"
     SKIPPED = "skipped"
     RETRY_REQUIRED = "retry_required"
+    NEEDS_REVIEW = "needs_review"
+
+
+class TelegramClaimError(RuntimeError):
+    """Операция отклонена, потому что запись принадлежит другому worker-у."""
 
 
 STATUS_LABELS: dict[ProcessingStatus, str] = {
@@ -25,6 +30,7 @@ STATUS_LABELS: dict[ProcessingStatus, str] = {
     ProcessingStatus.QUEUED: "В очереди на обработку",
     ProcessingStatus.SKIPPED: "Пропущен",
     ProcessingStatus.RETRY_REQUIRED: "Требуется повторная обработка",
+    ProcessingStatus.NEEDS_REVIEW: "Требуется ручная проверка",
 }
 
 
@@ -47,6 +53,20 @@ class NewClient:
     sbis_emails: tuple[str, ...]
     telegram_emails: tuple[str, ...]
     status: ProcessingStatus
+    legal_address: str | None = None
+    director_inn: str | None = None
+    personalised_phones: tuple[str, ...] = ()
+    personalised_emails: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TelegramSearchAttempt:
+    client_spp_id: int
+    attempt_number: int
+    stage: str
+    result_code: str
+    error_code: str | None
+    created_at: str
 
 
 class NewClientStorage:
@@ -73,13 +93,19 @@ class NewClientStorage:
                     director_last_name TEXT,
                     director_first_name TEXT,
                     director_middle_name TEXT,
+                    legal_address TEXT,
+                    director_inn TEXT,
                     status TEXT NOT NULL DEFAULT 'queued',
+                    needs_review INTEGER NOT NULL DEFAULT 0,
+                    telegram_claim_token TEXT,
+                    telegram_claimed_at TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     CHECK (is_entrepreneur IN (0, 1)),
                     CHECK (status IN (
                         'processed', 'queued', 'skipped', 'retry_required'
                     )),
+                    CHECK (needs_review IN (0, 1)),
                     CHECK (length(inn) IN (10, 12)),
                     CHECK (inn NOT GLOB '*[^0-9]*'),
                     CHECK (kpp IS NULL OR (
@@ -106,6 +132,41 @@ class NewClientStorage:
                     FOREIGN KEY (client_spp_id) REFERENCES new_clients(spp_id)
                         ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS telegram_search_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_spp_id INTEGER NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    stage TEXT NOT NULL,
+                    result_code TEXT NOT NULL,
+                    error_code TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (client_spp_id, attempt_number),
+                    FOREIGN KEY (client_spp_id) REFERENCES new_clients(spp_id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS new_client_personalised_contacts (
+                    client_spp_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    value TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (client_spp_id, kind, position),
+                    UNIQUE (client_spp_id, kind, value),
+                    CHECK (kind IN ('phone', 'email')),
+                    FOREIGN KEY (client_spp_id) REFERENCES new_clients(spp_id)
+                        ON DELETE CASCADE
+                );
+                """
+            )
+            self._ensure_needs_review_column(connection)
+            self._ensure_telegram_claim_columns(connection)
+            self._ensure_company_card_columns(connection)
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_new_clients_telegram_claim
+                ON new_clients (telegram_claim_token, telegram_claimed_at)
                 """
             )
 
@@ -174,6 +235,82 @@ class NewClientStorage:
         """Сохранить список, полученный пользовательским преобразователем СБИС."""
         return [self.upsert_from_sbis(record) for record in records]
 
+    def upsert_from_company_card(self, card: dict[str, Any]) -> NewClient:
+        """Сохранить данные ContractorCard.Read и отдельные personalised-контакты."""
+        spp_data = card.get("spp_data")
+        extra_data = card.get("extra_data")
+        if not isinstance(spp_data, dict):
+            raise ValueError("Карточка не содержит spp_data")
+        if not isinstance(extra_data, dict):
+            raise ValueError("Карточка не содержит extra_data")
+
+        spp_id = self._positive_int(
+            spp_data.get("ИдентификаторСПП", card.get("ИдентификаторСПП"))
+        )
+        inn = self._digits(card.get("ИНН"), "ИНН", (10, 12))
+        kpp = self._optional_digits(card.get("КПП"), "КПП", 9)
+        contacts = extra_data.get("Контрагент.GetPersonalisedContacts")
+        contact_rows = contacts if isinstance(contacts, list) else []
+        phones = self._nested_contacts(contact_rows, "Phones")
+        emails = self._nested_contacts(contact_rows, "Emails")
+
+        values = (
+            spp_id,
+            self._required(card.get("ShortName"), "ShortName"),
+            self._optional_text(spp_data.get("Регион")),
+            self._optional_text(card.get("ОГРН", spp_data.get("ОГРН"))),
+            inn,
+            kpp,
+            int(bool(spp_data.get("Предприниматель"))),
+            self._date_text(card.get("ДатаРегистрации")),
+            self._date_text(card.get("ДатаЛиквидации")),
+            self._optional_text(spp_data.get("Директор.Фамилия")),
+            self._optional_text(spp_data.get("Директор.Имя")),
+            self._optional_text(spp_data.get("Директор.Отчество")),
+            self._optional_text(card.get("АдресЮридический")),
+            self._digits(
+                spp_data.get("Директор.ИНН"),
+                "Директор.ИНН",
+                (10, 12),
+            )
+            if spp_data.get("Директор.ИНН") else None,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO new_clients (
+                    spp_id, name, region, ogrn, inn, kpp, is_entrepreneur,
+                    registration_date, liquidation_date, director_last_name,
+                    director_first_name, director_middle_name, legal_address,
+                    director_inn
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(spp_id) DO UPDATE SET
+                    name = excluded.name, region = excluded.region,
+                    ogrn = excluded.ogrn, inn = excluded.inn, kpp = excluded.kpp,
+                    is_entrepreneur = excluded.is_entrepreneur,
+                    registration_date = excluded.registration_date,
+                    liquidation_date = excluded.liquidation_date,
+                    director_last_name = excluded.director_last_name,
+                    director_first_name = excluded.director_first_name,
+                    director_middle_name = excluded.director_middle_name,
+                    legal_address = excluded.legal_address,
+                    director_inn = excluded.director_inn,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                values,
+            )
+            self._replace_personalised_contacts(connection, spp_id, "phone", phones)
+            self._replace_personalised_contacts(connection, spp_id, "email", emails)
+
+        client = self.get(spp_id)
+        if client is None:  # pragma: no cover
+            raise RuntimeError("Сохраненная карточка клиента не найдена")
+        return client
+
+    def save_company_cards(self, cards: Iterable[dict[str, Any]]) -> list[NewClient]:
+        """Идемпотентно сохранить набор подробных карточек СБИС."""
+        return [self.upsert_from_company_card(card) for card in cards]
+
     def replace_telegram_contacts(
         self,
         spp_id: int,
@@ -198,23 +335,189 @@ class NewClientStorage:
             raise RuntimeError("Клиент не найден после обновления контактов")
         return client
 
+    def save_telegram_result(
+        self,
+        spp_id: int,
+        *,
+        phones: Iterable[str] | str = (),
+        emails: Iterable[str] | str = (),
+        status: ProcessingStatus | str,
+        stage: str,
+        result_code: str,
+        error_code: str | None = None,
+        claim_token: str | None = None,
+    ) -> NewClient:
+        """Атомарно сохранить итог и освободить принадлежащий caller-у claim.
+
+        Без ``claim_token`` сохранять разрешено только незахваченную запись.
+        Это сохраняет совместимость старых вызовов, но не позволяет им снять
+        claim другого worker-а.
+        """
+        clean_status, stored_status, needs_review = self._stored_status(status)
+        clean_stage = self._required(stage, "Этап Telegram")
+        clean_result_code = self._required(result_code, "Код результата Telegram")
+        clean_error_code = self._optional_text(error_code)
+        clean_phones = self._contacts(phones)
+        clean_emails = self._contacts(emails)
+        clean_claim_token = (
+            self._required(claim_token, "Telegram claim token")
+            if claim_token is not None
+            else None
+        )
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_client(connection, spp_id)
+            self._require_telegram_claim(
+                connection,
+                spp_id,
+                clean_claim_token,
+            )
+            self._replace_contacts(
+                connection, spp_id, "phone", "telegram", clean_phones
+            )
+            self._replace_contacts(
+                connection, spp_id, "email", "telegram", clean_emails
+            )
+            connection.execute(
+                """
+                UPDATE new_clients
+                SET status = ?, needs_review = ?,
+                    telegram_claim_token = NULL,
+                    telegram_claimed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE spp_id = ?
+                """,
+                (stored_status, needs_review, spp_id),
+            )
+            attempt_number = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_number), 0) + 1
+                    FROM telegram_search_attempts
+                    WHERE client_spp_id = ?
+                    """,
+                    (spp_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO telegram_search_attempts (
+                    client_spp_id, attempt_number, stage, result_code, error_code
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    spp_id,
+                    attempt_number,
+                    clean_stage,
+                    clean_result_code,
+                    clean_error_code,
+                ),
+            )
+
+        client = self.get(spp_id)
+        if client is None:  # pragma: no cover
+            raise RuntimeError("Клиент не найден после сохранения результата")
+        if client.status is not clean_status:  # pragma: no cover
+            raise RuntimeError("Статус клиента сохранён некорректно")
+        return client
+
+    def claim_for_processing(
+        self,
+        limit: int,
+        claim_token: str,
+        stale_after_seconds: int = 900,
+    ) -> list[NewClient]:
+        """Атомарно закрепить первые доступные записи за одним worker-ом."""
+        self._validate_processing_limit(limit)
+        clean_claim_token = self._required(
+            claim_token,
+            "Telegram claim token",
+        )
+        if (
+            isinstance(stale_after_seconds, bool)
+            or not isinstance(stale_after_seconds, int)
+            or stale_after_seconds < 0
+        ):
+            raise ValueError(
+                "stale_after_seconds должен быть неотрицательным целым числом"
+            )
+
+        stale_modifier = f"-{stale_after_seconds} seconds"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT * FROM new_clients
+                WHERE status IN ('queued', 'retry_required')
+                    AND needs_review = 0
+                    AND (
+                        telegram_claim_token IS NULL
+                        OR telegram_claimed_at IS NULL
+                        OR datetime(telegram_claimed_at) <= datetime('now', ?)
+                    )
+                ORDER BY created_at, spp_id
+                LIMIT ?
+                """,
+                (stale_modifier, limit),
+            ).fetchall()
+            spp_ids = tuple(int(row["spp_id"]) for row in rows)
+            connection.executemany(
+                """
+                UPDATE new_clients
+                SET telegram_claim_token = ?,
+                    telegram_claimed_at = CURRENT_TIMESTAMP
+                WHERE spp_id = ?
+                """,
+                (
+                    (clean_claim_token, spp_id)
+                    for spp_id in spp_ids
+                ),
+            )
+            return [self._to_client(connection, row) for row in rows]
+
+    def release_claim(self, spp_id: int, claim_token: str) -> NewClient:
+        """Освободить claim только при совпадении его непрозрачного токена."""
+        clean_claim_token = self._required(
+            claim_token,
+            "Telegram claim token",
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_client(connection, spp_id)
+            cursor = connection.execute(
+                """
+                UPDATE new_clients
+                SET telegram_claim_token = NULL,
+                    telegram_claimed_at = NULL
+                WHERE spp_id = ? AND telegram_claim_token = ?
+                """,
+                (spp_id, clean_claim_token),
+            )
+            if cursor.rowcount == 0:
+                raise TelegramClaimError(
+                    f"Telegram claim клиента СБИС {spp_id} не принадлежит caller-у"
+                )
+
+        client = self.get(spp_id)
+        if client is None:  # pragma: no cover
+            raise RuntimeError("Клиент не найден после освобождения claim")
+        return client
+
     def set_status(
         self, spp_id: int, status: ProcessingStatus | str
     ) -> NewClient:
         """Установить статус обработки клиента."""
-        try:
-            clean_status = ProcessingStatus(status)
-        except ValueError as error:
-            raise ValueError(f"Неизвестный статус обработки: {status}") from error
+        clean_status, stored_status, needs_review = self._stored_status(status)
 
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE new_clients
-                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                SET status = ?, needs_review = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE spp_id = ?
                 """,
-                (clean_status.value, spp_id),
+                (stored_status, needs_review, spp_id),
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Клиент СБИС {spp_id} не найден")
@@ -233,13 +536,47 @@ class NewClientStorage:
                 return None
             return self._to_client(connection, row)
 
+    def latest_telegram_attempt(
+        self,
+        *,
+        result_code: str | None = None,
+    ) -> TelegramSearchAttempt | None:
+        """Вернуть последнюю попытку Telegram, при необходимости по коду."""
+        query = """
+            SELECT client_spp_id, attempt_number, stage, result_code,
+                   error_code, created_at
+            FROM telegram_search_attempts
+        """
+        parameters: tuple[str, ...] = ()
+        if result_code is not None:
+            clean_result_code = self._required(
+                result_code, "Код результата Telegram"
+            )
+            query += " WHERE result_code = ?"
+            parameters = (clean_result_code,)
+        query += " ORDER BY id DESC LIMIT 1"
+        with self._connect() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        if row is None:
+            return None
+        return TelegramSearchAttempt(
+            client_spp_id=int(row["client_spp_id"]),
+            attempt_number=int(row["attempt_number"]),
+            stage=str(row["stage"]),
+            result_code=str(row["result_code"]),
+            error_code=self._row_optional(row["error_code"]),
+            created_at=str(row["created_at"]),
+        )
+
     def list_for_processing(self, limit: int | None = None) -> list[NewClient]:
         """Вернуть очередь и записи, которым требуется повторная обработка."""
-        if limit is not None and (isinstance(limit, bool) or limit <= 0):
-            raise ValueError("limit должен быть положительным целым числом")
+        if limit is not None:
+            self._validate_processing_limit(limit)
         query = """
             SELECT * FROM new_clients
             WHERE status IN ('queued', 'retry_required')
+                AND needs_review = 0
+                AND telegram_claim_token IS NULL
             ORDER BY created_at, spp_id
         """
         parameters: tuple[int, ...] = ()
@@ -272,6 +609,13 @@ class NewClientStorage:
             """,
             (row["spp_id"],),
         ).fetchall()
+        personalised_contacts = connection.execute(
+            """
+            SELECT kind, value FROM new_client_personalised_contacts
+            WHERE client_spp_id = ? ORDER BY kind, position
+            """,
+            (row["spp_id"],),
+        ).fetchall()
 
         def values(kind: str, source: str) -> tuple[str, ...]:
             return tuple(
@@ -297,7 +641,23 @@ class NewClientStorage:
             telegram_phones=values("phone", "telegram"),
             sbis_emails=values("email", "sbis"),
             telegram_emails=values("email", "telegram"),
-            status=ProcessingStatus(row["status"]),
+            status=(
+                ProcessingStatus.NEEDS_REVIEW
+                if bool(row["needs_review"])
+                else ProcessingStatus(row["status"])
+            ),
+            legal_address=cls._row_optional(row["legal_address"]),
+            director_inn=cls._row_optional(row["director_inn"]),
+            personalised_phones=tuple(
+                str(contact["value"])
+                for contact in personalised_contacts
+                if contact["kind"] == "phone"
+            ),
+            personalised_emails=tuple(
+                str(contact["value"])
+                for contact in personalised_contacts
+                if contact["kind"] == "email"
+            ),
         )
 
     @staticmethod
@@ -328,12 +688,121 @@ class NewClientStorage:
         )
 
     @staticmethod
+    def _replace_personalised_contacts(
+        connection: sqlite3.Connection,
+        spp_id: int,
+        kind: str,
+        contacts: tuple[str, ...],
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM new_client_personalised_contacts
+            WHERE client_spp_id = ? AND kind = ?
+            """,
+            (spp_id, kind),
+        )
+        connection.executemany(
+            """
+            INSERT INTO new_client_personalised_contacts
+                (client_spp_id, kind, position, value)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                (spp_id, kind, position, value)
+                for position, value in enumerate(contacts)
+            ),
+        )
+
+    @staticmethod
     def _require_client(connection: sqlite3.Connection, spp_id: int) -> None:
         exists = connection.execute(
             "SELECT 1 FROM new_clients WHERE spp_id = ?", (spp_id,)
         ).fetchone()
         if exists is None:
             raise KeyError(f"Клиент СБИС {spp_id} не найден")
+
+    @staticmethod
+    def _ensure_needs_review_column(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(new_clients)")
+        }
+        if "needs_review" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE new_clients
+                ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0
+                CHECK (needs_review IN (0, 1))
+                """
+            )
+
+    @staticmethod
+    def _ensure_telegram_claim_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(new_clients)")
+        }
+        if "telegram_claim_token" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN telegram_claim_token TEXT"
+            )
+        if "telegram_claimed_at" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN telegram_claimed_at TEXT"
+            )
+
+    @staticmethod
+    def _ensure_company_card_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(new_clients)")
+        }
+        if "legal_address" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN legal_address TEXT"
+            )
+        if "director_inn" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN director_inn TEXT"
+            )
+
+    @staticmethod
+    def _require_telegram_claim(
+        connection: sqlite3.Connection,
+        spp_id: int,
+        claim_token: str | None,
+    ) -> None:
+        stored_claim = connection.execute(
+            "SELECT telegram_claim_token FROM new_clients WHERE spp_id = ?",
+            (spp_id,),
+        ).fetchone()[0]
+        if claim_token is None:
+            if stored_claim is not None:
+                raise TelegramClaimError(
+                    f"Клиент СБИС {spp_id} уже закреплён за другим worker-ом"
+                )
+            return
+        if stored_claim != claim_token:
+            raise TelegramClaimError(
+                f"Telegram claim клиента СБИС {spp_id} не совпадает"
+            )
+
+    @staticmethod
+    def _validate_processing_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit должен быть положительным целым числом")
+
+    @staticmethod
+    def _stored_status(
+        status: ProcessingStatus | str,
+    ) -> tuple[ProcessingStatus, str, int]:
+        try:
+            clean_status = ProcessingStatus(status)
+        except ValueError as error:
+            raise ValueError(f"Неизвестный статус обработки: {status}") from error
+        if clean_status is ProcessingStatus.NEEDS_REVIEW:
+            return clean_status, ProcessingStatus.RETRY_REQUIRED.value, 1
+        return clean_status, clean_status.value, 0
 
     @staticmethod
     def _positive_int(value: Any) -> int:
@@ -409,6 +878,22 @@ class NewClientStorage:
                 seen.add(clean_item)
                 result.append(clean_item)
         return tuple(result)
+
+    @classmethod
+    def _nested_contacts(
+        cls,
+        rows: list[Any],
+        field_name: str,
+    ) -> tuple[str, ...]:
+        result: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            value = row.get(field_name)
+            if value is None:
+                continue
+            result.extend(cls._contacts(value))
+        return tuple(dict.fromkeys(result))
 
     @staticmethod
     def _row_optional(value: Any) -> str | None:
