@@ -6,6 +6,7 @@ from src.integrations.sbis.clients import (
     getClientsByListId,
     getContactsByInn,
 )
+from src.integrations.sbis.companies import get_open_companies_by_date
 
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "getClientByInn",
     "getClientsByListId",
     "getContactsByInn",
+    "get_open_companies_by_date",
 ]

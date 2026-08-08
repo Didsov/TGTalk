@@ -7,3 +7,6 @@ __pycache__/
 .ruff_cache/
 *.session
 *.session-journal
+data/
+Json test/
+bot answer/
