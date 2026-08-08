@@ -57,6 +57,8 @@ class NewClient:
     director_inn: str | None = None
     personalised_phones: tuple[str, ...] = ()
     personalised_emails: tuple[str, ...] = ()
+    report_id: str | None = None
+    reported_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,8 @@ class NewClientStorage:
                     director_middle_name TEXT,
                     legal_address TEXT,
                     director_inn TEXT,
+                    report_id TEXT,
+                    reported_at TEXT,
                     status TEXT NOT NULL DEFAULT 'queued',
                     needs_review INTEGER NOT NULL DEFAULT 0,
                     telegram_claim_token TEXT,
@@ -163,6 +167,7 @@ class NewClientStorage:
             self._ensure_needs_review_column(connection)
             self._ensure_telegram_claim_columns(connection)
             self._ensure_company_card_columns(connection)
+            self._ensure_report_columns(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_new_clients_telegram_claim
@@ -658,6 +663,8 @@ class NewClientStorage:
                 for contact in personalised_contacts
                 if contact["kind"] == "email"
             ),
+            report_id=cls._row_optional(row["report_id"]),
+            reported_at=cls._row_optional(row["reported_at"]),
         )
 
     @staticmethod
@@ -764,6 +771,21 @@ class NewClientStorage:
         if "director_inn" not in columns:
             connection.execute(
                 "ALTER TABLE new_clients ADD COLUMN director_inn TEXT"
+            )
+
+    @staticmethod
+    def _ensure_report_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(new_clients)")
+        }
+        if "report_id" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN report_id TEXT"
+            )
+        if "reported_at" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN reported_at TEXT"
             )
 
     @staticmethod

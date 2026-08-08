@@ -98,13 +98,34 @@ async def _enrich_client(
     phones = list(client.telegram_phones)
     emails = list(client.telegram_emails)
 
-    if not is_valid_inn(client.director_inn):
-        return _manual_review(
+    if client.director_inn is None:
+        return _outcome(
             client,
+            ProcessingStatus.SKIPPED,
+            phones,
+            emails,
+            "director_inn_validation",
+            "director_inn_missing",
+        )
+    if not is_valid_inn(client.director_inn):
+        return _outcome(
+            client,
+            ProcessingStatus.SKIPPED,
             phones,
             emails,
             "director_inn_validation",
             "invalid_director_inn",
+        )
+
+    director_name = _director_name(client)
+    if director_name is None:
+        return _outcome(
+            client,
+            ProcessingStatus.SKIPPED,
+            phones,
+            emails,
+            "director_name_validation",
+            "director_name_missing",
         )
 
     try:
@@ -134,7 +155,6 @@ async def _enrich_client(
         return _temporary_bot_response(client, phones, emails, "inn_query")
     if response_kind is BotResponseKind.UNKNOWN:
         return _manual_review(client, phones, emails, "inn_query", "unknown_response")
-    director_name = _director_name(client)
     if response_kind is not BotResponseKind.NOT_FOUND:
         first_url = await extractReportUrlAsync(inn_response)
         if first_url is None:

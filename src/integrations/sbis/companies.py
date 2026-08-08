@@ -320,6 +320,8 @@ def _save_companies(
 
 async def get_open_companies_by_date(
     target_date: date | str | None = None,
+    *,
+    database_path: str | Path = DEFAULT_COMPANY_DATABASE_PATH,
 ) -> list[dict[str, Any]]:
     """Получить и сохранить организации за день; по умолчанию — за сегодня.
 
@@ -380,7 +382,7 @@ async def get_open_companies_by_date(
                 break
             page_number += 1
 
-    storage = NewClientStorage(DEFAULT_COMPANY_DATABASE_PATH)
+    storage = NewClientStorage(database_path)
     storage.initialize()
     cards: list[dict[str, Any]] = []
     requested_cards = 0

@@ -440,7 +440,7 @@ class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.stage, "inn_report_download")
         self.assertEqual(outcome.error_code, "report_http_503")
 
-    async def test_invalid_inn_requires_review_without_sending(self) -> None:
+    async def test_invalid_director_inn_is_skipped_without_sending(self) -> None:
         send_query = AsyncMock()
         with patch(
             "src.application.telegram_enrichment.sendQueryAndWait",
@@ -450,8 +450,41 @@ class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
                 client(director_inn="7700000017"), Mock()
             )
 
-        self.assertEqual(outcome.status, ProcessingStatus.NEEDS_REVIEW)
+        self.assertEqual(outcome.status, ProcessingStatus.SKIPPED)
         self.assertEqual(outcome.result_code, "invalid_director_inn")
+        send_query.assert_not_awaited()
+
+    async def test_missing_director_inn_is_skipped_without_sending(self) -> None:
+        send_query = AsyncMock()
+        with patch(
+            "src.application.telegram_enrichment.sendQueryAndWait",
+            new=send_query,
+        ):
+            outcome = await enrich_client(client(director_inn=None), Mock())
+
+        self.assertEqual(outcome.status, ProcessingStatus.SKIPPED)
+        self.assertEqual(outcome.result_code, "director_inn_missing")
+        self.assertEqual(outcome.requests_spent, 0)
+        send_query.assert_not_awaited()
+
+    async def test_missing_director_name_is_skipped_without_sending(self) -> None:
+        send_query = AsyncMock()
+        with patch(
+            "src.application.telegram_enrichment.sendQueryAndWait",
+            new=send_query,
+        ):
+            outcome = await enrich_client(
+                client(
+                    director_last_name=None,
+                    director_first_name=None,
+                    director_middle_name=None,
+                ),
+                Mock(),
+            )
+
+        self.assertEqual(outcome.status, ProcessingStatus.SKIPPED)
+        self.assertEqual(outcome.result_code, "director_name_missing")
+        self.assertEqual(outcome.requests_spent, 0)
         send_query.assert_not_awaited()
 
 

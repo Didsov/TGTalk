@@ -119,6 +119,24 @@ class NewClientStorageTests(unittest.TestCase):
         self.assertEqual(saved.telegram_phones, ("+79991112233",))
         self.assertEqual(saved.status, ProcessingStatus.PROCESSED)
 
+    def test_company_card_import_preserves_report_fields(self) -> None:
+        self.storage.upsert_from_company_card(company_card())
+        with closing(sqlite3.connect(self.storage.database_path)) as connection:
+            connection.execute(
+                """
+                UPDATE new_clients
+                SET report_id = ?, reported_at = ?
+                WHERE spp_id = ?
+                """,
+                ("weekly-2026-08-09", "2026-08-09 09:00:00", 30852759),
+            )
+            connection.commit()
+
+        saved = self.storage.upsert_from_company_card(company_card())
+
+        self.assertEqual(saved.report_id, "weekly-2026-08-09")
+        self.assertEqual(saved.reported_at, "2026-08-09 09:00:00")
+
     def test_repeat_import_updates_sbis_but_preserves_telegram_and_status(self) -> None:
         self.storage.upsert_from_sbis(sbis_client())
         self.storage.replace_telegram_contacts(
@@ -228,6 +246,8 @@ class NewClientStorageTests(unittest.TestCase):
         self.assertIn("telegram_claimed_at", columns)
         self.assertIn("legal_address", columns)
         self.assertIn("director_inn", columns)
+        self.assertIn("report_id", columns)
+        self.assertIn("reported_at", columns)
 
     def test_concurrent_tokens_cannot_claim_the_same_client(self) -> None:
         self.storage.upsert_from_sbis(sbis_client())

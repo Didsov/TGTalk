@@ -23,6 +23,21 @@
             "justMyCode": true
         },
         {
+            "name": "Ежедневный конвейер: СБИС → Telegram → БД",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.cli.daily_pipeline",
+            "args": [
+                "--limit",
+                "1000",
+                "--timeout",
+                "45"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
             "name": "Telegram: 3 клиент[а] с записью в БД",
             "type": "debugpy",
             "request": "launch",
