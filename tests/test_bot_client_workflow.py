@@ -1,16 +1,19 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.integrations.telegram.bot_client import (
     BotResponseKind,
     classifyBotResponse,
     clickRussiaAndWait,
     clickRussiaCallback,
+    clickProfileCallback,
     extractReportUrl,
     extractReportUrlAsync,
     getLatestIncomingMessage,
+    getAvailableQueries,
+    parseAvailableQueries,
     sendMessageAndGetResponse,
     sendQueryAndWait,
     waitForResponseOrEdit,
@@ -18,6 +21,15 @@ from src.integrations.telegram.bot_client import (
 
 
 class ResponseHelpersTests(unittest.TestCase):
+    def test_parses_available_queries_from_profile(self) -> None:
+        profile = """**Ваш ID:** 123\n\n**Доступно запросов:** 34\n**Баланс:** 0"""
+
+        self.assertEqual(parseAvailableQueries(profile), 34)
+
+    def test_rejects_profile_without_available_queries(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Доступно запросов"):
+            parseAvailableQueries("Ваш баланс: 0")
+
     def test_classifies_explicit_not_found_response(self) -> None:
         message = SimpleNamespace(
             raw_text="К сожалению, по данному запросу ничего не найдено."
@@ -272,6 +284,85 @@ class ConversationHelpersTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CallbackHelpersTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clicks_profile_callback_by_text(self) -> None:
+        profile = SimpleNamespace(
+            text="👤 Мой профиль",
+            data=b"profile",
+            click=AsyncMock(return_value="clicked"),
+        )
+        message = SimpleNamespace(buttons=[[profile]])
+
+        result = await clickProfileCallback(message)
+
+        self.assertEqual(result, "clicked")
+        profile.click.assert_awaited_once_with()
+
+    async def test_gets_available_queries_through_menu_callback(self) -> None:
+        profile_button = SimpleNamespace(
+            text="Мой профиль",
+            data=b"profile",
+            click=AsyncMock(),
+        )
+        menu = SimpleNamespace(id=80, buttons=[[profile_button]])
+        profile = SimpleNamespace(
+            id=81,
+            raw_text="Ваш ID: 123\nДоступно запросов: 34\nВаш баланс: $0.00",
+        )
+        never_edit = asyncio.get_running_loop().create_future()
+        conversation = AsyncMock()
+        conversation.__aenter__.return_value = conversation
+        conversation.get_response.return_value = profile
+        conversation.get_edit.return_value = never_edit
+        client = Mock()
+        client.conversation.return_value = conversation
+
+        with patch(
+            "src.integrations.telegram.bot_client.sendQueryAndWait",
+            new=AsyncMock(return_value=menu),
+        ) as send_query:
+            result = await getAvailableQueries(client, "@target", timeout=7)
+
+        self.assertEqual(result, 34)
+        send_query.assert_awaited_once_with(conversation, "/menu", timeout=7)
+        profile_button.click.assert_awaited_once_with()
+        conversation.get_edit.assert_called_once_with(timeout=7)
+
+    async def test_profile_message_does_not_wait_for_slow_callback_answer(
+        self,
+    ) -> None:
+        callback_answer = asyncio.get_running_loop().create_future()
+
+        async def slow_click():
+            await callback_answer
+
+        profile_button = SimpleNamespace(
+            text="Мой профиль",
+            data=b"profile",
+            click=AsyncMock(side_effect=slow_click),
+        )
+        menu = SimpleNamespace(id=90, buttons=[[profile_button]])
+        profile = SimpleNamespace(
+            id=91,
+            raw_text="Доступно запросов: 12",
+        )
+        never_edit = asyncio.get_running_loop().create_future()
+        conversation = AsyncMock()
+        conversation.__aenter__.return_value = conversation
+        conversation.get_response.return_value = profile
+        conversation.get_edit.return_value = never_edit
+        client = Mock()
+        client.conversation.return_value = conversation
+
+        with patch(
+            "src.integrations.telegram.bot_client.sendQueryAndWait",
+            new=AsyncMock(return_value=menu),
+        ):
+            result = await getAvailableQueries(client, "@target", timeout=7)
+
+        self.assertEqual(result, 12)
+        profile_button.click.assert_awaited_once_with()
+        self.assertTrue(callback_answer.cancelled())
+
     async def test_clicks_russia_callback_by_text_not_position(self) -> None:
         kazakhstan = SimpleNamespace(
             text="Казахстан",

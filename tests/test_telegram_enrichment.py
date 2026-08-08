@@ -93,6 +93,7 @@ class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.phones, ("+79990000001",))
         self.assertEqual(outcome.emails, ("owner@example.test",))
         self.assertEqual(outcome.result_code, "phone_found_by_inn")
+        self.assertEqual(outcome.requests_spent, 1)
 
     async def test_loads_lazy_report_button_before_parsing(self) -> None:
         lazy_response = SimpleNamespace(
@@ -150,6 +151,7 @@ class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.status, ProcessingStatus.PROCESSED)
         self.assertEqual(outcome.result_code, "phone_found_by_email")
+        self.assertEqual(outcome.requests_spent, 2)
         self.assertEqual(send_query.await_args_list[0].args[1], f"/inn {SOURCE_INN}")
         self.assertEqual(send_query.await_args_list[1].args[1], "lookup@example.test")
         self.assertEqual(send_query.await_count, 2)
@@ -216,6 +218,7 @@ class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.status, ProcessingStatus.PROCESSED)
         self.assertEqual(outcome.result_code, "phone_found_by_person")
+        self.assertEqual(outcome.requests_spent, 3)
         self.assertEqual(send_query.await_args_list[1].args[1], "lookup@example.test")
         self.assertEqual(
             send_query.await_args_list[2].args[1],
@@ -226,6 +229,26 @@ class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
             "must-not-be-used@example.test",
             [call.args[1] for call in send_query.await_args_list],
         )
+
+    async def test_does_not_send_query_after_available_balance_is_spent(self) -> None:
+        send_query = AsyncMock(
+            return_value=message(url="http://localhost/r/inn-without-phone")
+        )
+        with patch(
+            "src.application.telegram_enrichment.sendQueryAndWait",
+            new=send_query,
+        ):
+            outcome = await enrich_client(
+                client(personalised_emails=("lookup@example.test",)),
+                Mock(),
+                report_loader=AsyncMock(return_value=FALLBACK_REPORT),
+                available_queries=1,
+            )
+
+        self.assertEqual(outcome.status, ProcessingStatus.RETRY_REQUIRED)
+        self.assertEqual(outcome.result_code, "available_queries_exhausted")
+        self.assertEqual(outcome.requests_spent, 1)
+        send_query.assert_awaited_once()
 
     async def test_falls_back_to_person_and_clicks_russia(self) -> None:
         send_query = AsyncMock(
@@ -439,6 +462,12 @@ class ProcessFirstClientsTests(unittest.IsolatedAsyncioTestCase):
             Path(self.temp_directory.name) / "clients.db"
         )
         self.storage.initialize()
+        self.get_balance = AsyncMock(return_value=100)
+        self.balance_patcher = patch(
+            "src.application.telegram_enrichment.getAvailableQueries",
+            new=self.get_balance,
+        )
+        self.balance_patcher.start()
         for spp_id in (1, 2, 3):
             self.storage.upsert_from_sbis(
                 {
@@ -460,6 +489,7 @@ class ProcessFirstClientsTests(unittest.IsolatedAsyncioTestCase):
             )
 
     def tearDown(self) -> None:
+        self.balance_patcher.stop()
         self.temp_directory.cleanup()
 
     async def test_dry_run_limits_clients_without_changing_database(self) -> None:
@@ -493,6 +523,65 @@ class ProcessFirstClientsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(enrich.await_count, 2)
         self.assertEqual(self.storage.get(1).status, ProcessingStatus.QUEUED)
+        self.get_balance.assert_awaited_once_with(
+            telegram_client,
+            "@stub",
+            timeout=30,
+        )
+
+    async def test_zero_balance_stops_before_opening_conversation(self) -> None:
+        self.get_balance.return_value = 0
+        telegram_client = Mock()
+        with patch(
+            "src.application.telegram_enrichment.notify_queries_exhausted"
+        ) as notify:
+            outcomes = await process_first_clients(
+                self.storage,
+                telegram_client,
+                "@stub",
+                limit=3,
+            )
+
+        self.assertEqual(outcomes, [])
+        telegram_client.conversation.assert_not_called()
+        notify.assert_called_once_with()
+
+    async def test_stops_batch_when_reported_balance_is_spent(self) -> None:
+        self.get_balance.return_value = 1
+        conversation = AsyncMock()
+        conversation.__aenter__.return_value = conversation
+        conversation.__aexit__.return_value = None
+        telegram_client = Mock()
+        telegram_client.conversation.return_value = conversation
+        first = EnrichmentOutcome(
+            client_spp_id=1,
+            status=ProcessingStatus.PROCESSED,
+            phones=("+79990000001",),
+            emails=(),
+            stage="inn_report_parse",
+            result_code="phone_found_by_inn",
+            requests_spent=1,
+        )
+        enrich = AsyncMock(return_value=first)
+        with (
+            patch(
+                "src.application.telegram_enrichment.enrich_client",
+                new=enrich,
+            ),
+            patch(
+                "src.application.telegram_enrichment.notify_queries_exhausted"
+            ) as notify,
+        ):
+            outcomes = await process_first_clients(
+                self.storage,
+                telegram_client,
+                "@stub",
+                limit=3,
+            )
+
+        self.assertEqual(outcomes, [first])
+        enrich.assert_awaited_once()
+        notify.assert_called_once_with()
 
     async def test_uses_only_queued_and_retry_clients_in_first_n(self) -> None:
         self.storage.set_status(1, ProcessingStatus.PROCESSED)

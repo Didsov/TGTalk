@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from enum import Enum
 from typing import Any
 
@@ -238,6 +239,79 @@ async def clickRussiaCallback(message: Message) -> Any:
         return await button.click()
 
     raise LookupError("В ответе бота нет callback-кнопки «Россия»")
+
+
+async def clickProfileCallback(message: Message) -> Any:
+    """Нажать callback-кнопку «Мой профиль», находя её по тексту."""
+    for button in await _messageButtons(message):
+        text = " ".join(str(getattr(button, "text", "")).casefold().split())
+        if "мой профиль" not in text:
+            continue
+        if getattr(button, "data", None) is None:
+            raise ValueError("Кнопка «Мой профиль» не является callback-кнопкой")
+        return await button.click()
+    raise LookupError("В меню бота нет callback-кнопки «Мой профиль»")
+
+
+def parseAvailableQueries(message: Message | str) -> int:
+    """Извлечь неотрицательное число из поля «Доступно запросов»."""
+    if isinstance(message, str):
+        text = message
+    else:
+        text = getattr(message, "raw_text", None) or getattr(message, "text", "")
+    match = re.search(
+        r"доступно\s+запросов[*_\s]*:\s*[*_\s]*(\d+)",
+        str(text),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError("Ответ профиля не содержит поле «Доступно запросов»")
+    return int(match.group(1))
+
+
+async def getAvailableQueries(
+    client: TelegramClient,
+    bot_username: str,
+    timeout: float = 30,
+) -> int:
+    """Получить остаток запросов через /menu и callback «Мой профиль»."""
+    async with client.conversation(bot_username, timeout=timeout) as conversation:
+        menu_message = await sendQueryAndWait(
+            conversation,
+            "/menu",
+            timeout=timeout,
+        )
+        waiters = _responseOrEditWaiters(conversation, menu_message, timeout)
+        click_task = asyncio.create_task(clickProfileCallback(menu_message))
+        profile_task = asyncio.create_task(
+            _waitForFirstMessage(waiters, timeout)
+        )
+        await asyncio.sleep(0)
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (profile_task, click_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if profile_task in done:
+                    profile_message = profile_task.result()
+                    break
+                # Успешный callback-ответ ещё не означает, что сообщение
+                # профиля уже пришло. Ошибку клика при этом не скрываем.
+                click_task.result()
+                profile_message = await profile_task
+                break
+        finally:
+            for task in (click_task, profile_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                click_task,
+                profile_task,
+                return_exceptions=True,
+            )
+            await _cancelWaiters(conversation, waiters)
+    return parseAvailableQueries(profile_message)
 
 
 def _responseOrEditWaiters(

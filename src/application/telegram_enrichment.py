@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
@@ -15,6 +15,7 @@ from src.integrations.telegram.bot_client import (
     classifyBotResponse,
     clickRussiaAndWait,
     extractReportUrlAsync,
+    getAvailableQueries,
     sendQueryAndWait,
 )
 from src.integrations.telegram.report_downloader import (
@@ -41,6 +42,11 @@ class EnrichmentOutcome:
     result_code: str
     error_code: str | None = None
     retry_after_seconds: int | None = None
+    requests_spent: int = 0
+
+
+class AvailableQueriesExhausted(RuntimeError):
+    """Платный запрос не отправлен из-за исчерпанного баланса."""
 
 
 async def enrich_client(
@@ -49,6 +55,44 @@ async def enrich_client(
     *,
     timeout: float = 30,
     report_loader: ReportLoader = download_report_text,
+    available_queries: int | None = None,
+) -> EnrichmentOutcome:
+    """Обогатить клиента и вернуть фактическое число платных запросов."""
+    requests_spent = 0
+
+    async def paid_query(
+        current_conversation: Any,
+        text: str,
+        *,
+        timeout: float,
+    ) -> Any:
+        nonlocal requests_spent
+        if available_queries is not None and requests_spent >= available_queries:
+            raise AvailableQueriesExhausted
+        requests_spent += 1
+        return await sendQueryAndWait(
+            current_conversation,
+            text,
+            timeout=timeout,
+        )
+
+    outcome = await _enrich_client(
+        client,
+        conversation,
+        timeout=timeout,
+        report_loader=report_loader,
+        query_sender=paid_query,
+    )
+    return replace(outcome, requests_spent=requests_spent)
+
+
+async def _enrich_client(
+    client: NewClient,
+    conversation: Any,
+    *,
+    timeout: float,
+    report_loader: ReportLoader,
+    query_sender: Callable[..., Awaitable[Any]],
 ) -> EnrichmentOutcome:
     """Искать по ИНН директора, почтам СБИС, затем ФИО и дате рождения."""
     phones = list(client.telegram_phones)
@@ -64,9 +108,11 @@ async def enrich_client(
         )
 
     try:
-        inn_response = await sendQueryAndWait(
+        inn_response = await query_sender(
             conversation, f"/inn {client.director_inn}", timeout=timeout
         )
+    except AvailableQueriesExhausted:
+        return _queries_exhausted(client, phones, emails, "inn_query")
     except FloodWaitError as error:
         return _flood_wait_outcome(
             client, phones, emails, "inn_query", error
@@ -133,9 +179,11 @@ async def enrich_client(
     )
     if personalised_email is not None:
         try:
-            email_response = await sendQueryAndWait(
+            email_response = await query_sender(
                 conversation, personalised_email, timeout=timeout
             )
+        except AvailableQueriesExhausted:
+            return _queries_exhausted(client, phones, emails, "email_query")
         except FloodWaitError as error:
             return _flood_wait_outcome(
                 client, phones, emails, "email_query", error
@@ -235,9 +283,11 @@ async def enrich_client(
     )
 
     try:
-        country_response = await sendQueryAndWait(
+        country_response = await query_sender(
             conversation, person_query, timeout=timeout
         )
+    except AvailableQueriesExhausted:
+        return _queries_exhausted(client, phones, emails, "person_query")
     except FloodWaitError as error:
         return _flood_wait_outcome(
             client, phones, emails, "person_query", error
@@ -374,12 +424,20 @@ async def process_first_clients(
     """Последовательно обработать первые N записей очереди."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("limit должен быть положительным целым числом")
+    available_queries = await getAvailableQueries(
+        telegram_client,
+        bot_username,
+        timeout=timeout,
+    )
     dry_run_clients = (
         iter(storage.list_for_processing(limit=limit)) if not write else None
     )
     claim_token = uuid4().hex if write else None
     outcomes: list[EnrichmentOutcome] = []
     for _ in range(limit):
+        if available_queries <= 0:
+            notify_queries_exhausted()
+            break
         if write:
             assert claim_token is not None
             claimed = storage.claim_for_processing(1, claim_token)
@@ -402,6 +460,7 @@ async def process_first_clients(
                     conversation,
                     timeout=timeout,
                     report_loader=report_loader,
+                    available_queries=available_queries,
                 )
         except FloodWaitError as error:
             outcome = _flood_wait_outcome(
@@ -458,6 +517,13 @@ async def process_first_clients(
                     type(error).__name__,
                 )
         outcomes.append(outcome)
+        available_queries = max(
+            0,
+            available_queries - outcome.requests_spent,
+        )
+        if available_queries == 0:
+            notify_queries_exhausted()
+            break
         if pause_batch:
             break
     return outcomes
@@ -540,6 +606,28 @@ def _temporary_bot_response(
         "temporary_error",
         "bot_temporary_error",
     )
+
+
+def _queries_exhausted(
+    client: NewClient,
+    phones: list[str],
+    emails: list[str],
+    stage: str,
+) -> EnrichmentOutcome:
+    return _outcome(
+        client,
+        ProcessingStatus.RETRY_REQUIRED,
+        phones,
+        emails,
+        stage,
+        "available_queries_exhausted",
+        "available_queries_exhausted",
+    )
+
+
+def notify_queries_exhausted() -> None:
+    """Временная заглушка уведомления об исчерпании платных запросов."""
+    print("Доступные запросы Telegram-бота закончились; обработка остановлена.")
 
 
 def _flood_wait_outcome(
