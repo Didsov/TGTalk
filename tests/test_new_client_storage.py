@@ -2,7 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import date
 from pathlib import Path
 from threading import Barrier
@@ -172,6 +172,245 @@ class NewClientStorageTests(unittest.TestCase):
 
         self.assertEqual([client.spp_id for client in pending], [3, 4])
 
+    def test_report_selection_reads_only_requested_registration_date(self) -> None:
+        self.storage.save_sbis_list(
+            [
+                sbis_client(
+                    ИдентификаторСПП=1,
+                    Название="Бета",
+                    ДатаРегистрации="2026-08-01",
+                ),
+                sbis_client(
+                    ИдентификаторСПП=2,
+                    Название="Альфа",
+                    ДатаРегистрации="2026-08-01T15:20:00",
+                ),
+                sbis_client(
+                    ИдентификаторСПП=3,
+                    ДатаРегистрации="2026-08-02",
+                ),
+            ]
+        )
+
+        selected = self.storage.list_by_registration_date("2026-08-01")
+
+        self.assertEqual([client.spp_id for client in selected], [2, 1])
+
+    def test_returns_latest_attempts_and_marks_clients_reported(self) -> None:
+        self.storage.save_sbis_list(
+            [sbis_client(ИдентификаторСПП=1), sbis_client(ИдентификаторСПП=2)]
+        )
+        for result_code in ("first", "second"):
+            self.storage.save_telegram_result(
+                1,
+                status=ProcessingStatus.RETRY_REQUIRED,
+                stage="test",
+                result_code=result_code,
+            )
+
+        attempts = self.storage.latest_attempts_for_clients([1, 2])
+        self.storage.mark_reported([1, 2], "daily-2026-08-01")
+
+        self.assertEqual(attempts[1].result_code, "second")
+        self.assertNotIn(2, attempts)
+        self.assertEqual(self.storage.get(1).report_id, "daily-2026-08-01")
+        self.assertIsNotNone(self.storage.get(2).reported_at)
+
+    def test_lists_only_clients_changed_after_previous_report(self) -> None:
+        self.storage.save_sbis_list(
+            [sbis_client(ИдентификаторСПП=1), sbis_client(ИдентификаторСПП=2)]
+        )
+        self.storage.mark_reported([1, 2], "1")
+        self.storage.set_status(1, ProcessingStatus.PROCESSED)
+
+        updates = self.storage.list_report_updates()
+
+        self.assertEqual([client.spp_id for client in updates], [1])
+
+    def test_report_updates_detect_revision_even_in_same_second(self) -> None:
+        self.storage.save_sbis_list([sbis_client(ИдентификаторСПП=1)])
+        self.storage.mark_reported([1], "1")
+        self.storage.replace_telegram_contacts(1, phones=["+79991112233"])
+        with closing(sqlite3.connect(self.storage.database_path)) as connection:
+            connection.execute(
+                """
+                UPDATE new_clients
+                SET updated_at = reported_at
+                WHERE spp_id = 1
+                """
+            )
+            connection.commit()
+
+        updates = self.storage.list_report_updates()
+
+        self.assertEqual([client.spp_id for client in updates], [1])
+
+    def test_repeated_mark_reported_closes_current_revision(self) -> None:
+        self.storage.save_sbis_list([sbis_client(ИдентификаторСПП=1)])
+        self.storage.mark_reported([1], "main")
+        self.storage.set_status(1, ProcessingStatus.PROCESSED)
+        self.assertEqual(
+            [client.spp_id for client in self.storage.list_report_updates()],
+            [1],
+        )
+
+        self.storage.mark_reported([1], "supplement")
+
+        self.assertEqual(self.storage.list_report_updates(), [])
+        client = self.storage.get(1)
+        self.assertEqual(client.report_id, "supplement")
+        self.assertEqual(client.reported_revision, client.data_revision)
+
+    def test_meaningful_public_updates_increment_data_revision(self) -> None:
+        created = self.storage.upsert_from_sbis(sbis_client())
+        self.assertEqual(created.data_revision, 0)
+
+        from_sbis = self.storage.upsert_from_sbis(sbis_client())
+        from_card = self.storage.upsert_from_company_card(company_card())
+        telegram_contacts = self.storage.replace_telegram_contacts(
+            30852759, phones=["+79991112233"]
+        )
+        telegram_result = self.storage.save_telegram_result(
+            30852759,
+            status=ProcessingStatus.PROCESSED,
+            stage="test",
+            result_code="found",
+        )
+        status_update = self.storage.set_status(
+            30852759, ProcessingStatus.SKIPPED
+        )
+
+        self.assertEqual(from_sbis.data_revision, 1)
+        self.assertEqual(from_card.data_revision, 2)
+        self.assertEqual(telegram_contacts.data_revision, 3)
+        self.assertEqual(telegram_result.data_revision, 4)
+        self.assertEqual(status_update.data_revision, 5)
+
+    def test_mark_reported_does_not_change_data_or_updated_at(self) -> None:
+        self.storage.upsert_from_sbis(sbis_client(ИдентификаторСПП=1))
+        with closing(sqlite3.connect(self.storage.database_path)) as connection:
+            connection.execute(
+                "UPDATE new_clients SET updated_at = ? WHERE spp_id = 1",
+                ("2000-01-01 00:00:00",),
+            )
+            connection.commit()
+
+        self.storage.mark_reported([1], "main")
+
+        with closing(sqlite3.connect(self.storage.database_path)) as connection:
+            row = connection.execute(
+                """
+                SELECT updated_at, data_revision, reported_revision
+                FROM new_clients WHERE spp_id = 1
+                """
+            ).fetchone()
+        self.assertEqual(row[0], "2000-01-01 00:00:00")
+        self.assertEqual(row[1], 0)
+        self.assertEqual(row[2], 0)
+
+    def test_mark_reported_does_not_hide_a_concurrent_data_change(self) -> None:
+        snapshot = self.storage.upsert_from_sbis(
+            sbis_client(ИдентификаторСПП=1)
+        )
+        changed = self.storage.set_status(1, ProcessingStatus.PROCESSED)
+
+        self.storage.mark_reported(
+            [1],
+            "stale-report",
+            expected_revisions={1: snapshot.data_revision},
+            expected_reported_revisions={1: snapshot.reported_revision},
+        )
+
+        self.assertIsNone(self.storage.get(1).reported_at)
+        self.storage.mark_reported(
+            [1],
+            "current-report",
+            expected_revisions={1: changed.data_revision},
+            expected_reported_revisions={1: changed.reported_revision},
+        )
+        self.assertEqual(self.storage.get(1).report_id, "current-report")
+
+    def test_mark_reported_uses_reported_revision_as_compare_and_swap(self) -> None:
+        snapshot = self.storage.upsert_from_sbis(
+            sbis_client(ИдентификаторСПП=1)
+        )
+        self.storage.mark_reported(
+            [1],
+            "winner",
+            expected_revisions={1: snapshot.data_revision},
+            expected_reported_revisions={1: snapshot.reported_revision},
+        )
+
+        self.storage.mark_reported(
+            [1],
+            "stale-worker",
+            expected_revisions={1: snapshot.data_revision},
+            expected_reported_revisions={1: snapshot.reported_revision},
+        )
+
+        self.assertEqual(self.storage.get(1).report_id, "winner")
+
+    def test_claim_and_release_do_not_change_data_revision(self) -> None:
+        created = self.storage.upsert_from_sbis(
+            sbis_client(ИдентификаторСПП=1)
+        )
+
+        claimed = self.storage.claim_for_processing(1, "worker")[0]
+        released = self.storage.release_claim(1, "worker")
+
+        self.assertEqual(created.data_revision, 0)
+        self.assertEqual(claimed.data_revision, 0)
+        self.assertEqual(released.data_revision, 0)
+
+    def test_report_update_hydration_does_not_use_n_plus_one_queries(self) -> None:
+        self.storage.save_sbis_list(
+            [
+                sbis_client(ИдентификаторСПП=1),
+                sbis_client(ИдентификаторСПП=2),
+                sbis_client(ИдентификаторСПП=3),
+            ]
+        )
+        self.storage.mark_reported([1, 2, 3], "main")
+        for spp_id in (1, 2, 3):
+            self.storage.replace_telegram_contacts(
+                spp_id, phones=[f"+7999000000{spp_id}"]
+            )
+
+        class TracedStorage(NewClientStorage):
+            def __init__(self, database_path):
+                super().__init__(database_path)
+                self.statements: list[str] = []
+
+            @contextmanager
+            def _connect(self):
+                with super()._connect() as connection:
+                    connection.set_trace_callback(self.statements.append)
+                    yield connection
+
+        traced = TracedStorage(self.storage.database_path)
+        clients = traced.list_report_updates()
+        select_count = sum(
+            statement.lstrip().upper().startswith("SELECT")
+            for statement in traced.statements
+        )
+
+        self.assertEqual([client.spp_id for client in clients], [1, 2, 3])
+        self.assertEqual(select_count, 3)
+
+    def test_lists_unreported_clients_only_through_cutoff_date(self) -> None:
+        self.storage.save_sbis_list(
+            [
+                sbis_client(ИдентификаторСПП=1, ДатаРегистрации="2026-08-01"),
+                sbis_client(ИдентификаторСПП=2, ДатаРегистрации="2026-08-02"),
+                sbis_client(ИдентификаторСПП=3, ДатаРегистрации="2026-08-03"),
+            ]
+        )
+        self.storage.mark_reported([1], "already-sent")
+
+        clients = self.storage.list_unreported_through("2026-08-02")
+
+        self.assertEqual([client.spp_id for client in clients], [2])
+
     def test_manual_review_is_not_returned_for_automatic_processing(self) -> None:
         self.storage.upsert_from_sbis(sbis_client())
 
@@ -226,10 +465,21 @@ class NewClientStorageTests(unittest.TestCase):
                     director_last_name TEXT,
                     director_first_name TEXT,
                     director_middle_name TEXT,
+                    report_id TEXT,
+                    reported_at TEXT,
                     status TEXT NOT NULL DEFAULT 'queued',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO new_clients (
+                    spp_id, name, inn, is_entrepreneur,
+                    report_id, reported_at
+                ) VALUES (1, 'Историческая организация', '7736641983', 0,
+                          'old-report', '2026-08-01 10:00:00')
                 """
             )
             connection.commit()
@@ -248,6 +498,17 @@ class NewClientStorageTests(unittest.TestCase):
         self.assertIn("director_inn", columns)
         self.assertIn("report_id", columns)
         self.assertIn("reported_at", columns)
+        self.assertIn("data_revision", columns)
+        self.assertIn("reported_revision", columns)
+        with closing(sqlite3.connect(database_path)) as connection:
+            revisions = connection.execute(
+                """
+                SELECT data_revision, reported_revision
+                FROM new_clients WHERE spp_id = 1
+                """
+            ).fetchone()
+        self.assertEqual(revisions, (0, 0))
+        self.assertEqual(storage.list_report_updates(), [])
 
     def test_concurrent_tokens_cannot_claim_the_same_client(self) -> None:
         self.storage.upsert_from_sbis(sbis_client())

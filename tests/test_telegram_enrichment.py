@@ -8,6 +8,7 @@ from telethon.errors import FloodWaitError
 
 from src.application.telegram_enrichment import (
     EnrichmentOutcome,
+    TelegramBalanceCheckError,
     enrich_client,
     process_first_clients,
 )
@@ -579,6 +580,21 @@ class ProcessFirstClientsTests(unittest.IsolatedAsyncioTestCase):
         telegram_client.conversation.assert_not_called()
         notify.assert_called_once_with()
 
+    async def test_balance_check_failure_has_distinct_error(self) -> None:
+        self.get_balance.side_effect = TimeoutError("synthetic")
+        observer = AsyncMock()
+
+        with self.assertRaises(TelegramBalanceCheckError):
+            await process_first_clients(
+                self.storage,
+                Mock(),
+                "@stub",
+                limit=1,
+                balance_observer=observer,
+            )
+
+        observer.assert_not_awaited()
+
     async def test_stops_batch_when_reported_balance_is_spent(self) -> None:
         self.get_balance.return_value = 1
         conversation = AsyncMock()
@@ -615,6 +631,72 @@ class ProcessFirstClientsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes, [first])
         enrich.assert_awaited_once()
         notify.assert_called_once_with()
+
+    async def test_reports_initial_and_remaining_balance_to_observer(self) -> None:
+        self.get_balance.return_value = 3
+        conversation = AsyncMock()
+        conversation.__aenter__.return_value = conversation
+        conversation.__aexit__.return_value = None
+        telegram_client = Mock()
+        telegram_client.conversation.return_value = conversation
+        observer = AsyncMock()
+        outcome = EnrichmentOutcome(
+            client_spp_id=1,
+            status=ProcessingStatus.PROCESSED,
+            phones=("+79990000001",),
+            emails=(),
+            stage="inn_report_parse",
+            result_code="phone_found_by_inn",
+            requests_spent=1,
+        )
+        with patch(
+            "src.application.telegram_enrichment.enrich_client",
+            new=AsyncMock(return_value=outcome),
+        ):
+            await process_first_clients(
+                self.storage,
+                telegram_client,
+                "@stub",
+                limit=1,
+                balance_observer=observer,
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in observer.await_args_list],
+            [3, 2],
+        )
+
+    async def test_balance_observer_failure_does_not_stop_enrichment(self) -> None:
+        self.get_balance.return_value = 3
+        conversation = AsyncMock()
+        conversation.__aenter__.return_value = conversation
+        conversation.__aexit__.return_value = None
+        telegram_client = Mock()
+        telegram_client.conversation.return_value = conversation
+        observer = AsyncMock(side_effect=RuntimeError("notification unavailable"))
+        outcome = EnrichmentOutcome(
+            client_spp_id=1,
+            status=ProcessingStatus.PROCESSED,
+            phones=("+79990000001",),
+            emails=(),
+            stage="inn_report_parse",
+            result_code="phone_found_by_inn",
+            requests_spent=1,
+        )
+        with patch(
+            "src.application.telegram_enrichment.enrich_client",
+            new=AsyncMock(return_value=outcome),
+        ):
+            outcomes = await process_first_clients(
+                self.storage,
+                telegram_client,
+                "@stub",
+                limit=1,
+                balance_observer=observer,
+            )
+
+        self.assertEqual(outcomes, [outcome])
+        self.assertEqual(observer.await_count, 2)
 
     async def test_uses_only_queued_and_retry_clients_in_first_n(self) -> None:
         self.storage.set_status(1, ProcessingStatus.PROCESSED)

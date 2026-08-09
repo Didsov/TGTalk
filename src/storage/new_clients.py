@@ -59,6 +59,8 @@ class NewClient:
     personalised_emails: tuple[str, ...] = ()
     report_id: str | None = None
     reported_at: str | None = None
+    data_revision: int = 0
+    reported_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,8 @@ class NewClientStorage:
                     director_inn TEXT,
                     report_id TEXT,
                     reported_at TEXT,
+                    data_revision INTEGER NOT NULL DEFAULT 0,
+                    reported_revision INTEGER,
                     status TEXT NOT NULL DEFAULT 'queued',
                     needs_review INTEGER NOT NULL DEFAULT 0,
                     telegram_claim_token TEXT,
@@ -110,6 +114,10 @@ class NewClientStorage:
                         'processed', 'queued', 'skipped', 'retry_required'
                     )),
                     CHECK (needs_review IN (0, 1)),
+                    CHECK (data_revision >= 0),
+                    CHECK (
+                        reported_revision IS NULL OR reported_revision >= 0
+                    ),
                     CHECK (length(inn) IN (10, 12)),
                     CHECK (inn NOT GLOB '*[^0-9]*'),
                     CHECK (kpp IS NULL OR (
@@ -168,10 +176,17 @@ class NewClientStorage:
             self._ensure_telegram_claim_columns(connection)
             self._ensure_company_card_columns(connection)
             self._ensure_report_columns(connection)
+            self._ensure_report_revision_columns(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_new_clients_telegram_claim
                 ON new_clients (telegram_claim_token, telegram_claimed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_new_clients_report_revision
+                ON new_clients (reported_revision, data_revision)
                 """
             )
 
@@ -220,6 +235,7 @@ class NewClientStorage:
                     director_last_name = excluded.director_last_name,
                     director_first_name = excluded.director_first_name,
                     director_middle_name = excluded.director_middle_name,
+                    data_revision = new_clients.data_revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 values,
@@ -300,6 +316,7 @@ class NewClientStorage:
                     director_middle_name = excluded.director_middle_name,
                     legal_address = excluded.legal_address,
                     director_inn = excluded.director_inn,
+                    data_revision = new_clients.data_revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 values,
@@ -333,6 +350,16 @@ class NewClientStorage:
             if emails is not None:
                 self._replace_contacts(
                     connection, spp_id, "email", "telegram", self._contacts(emails)
+                )
+            if phones is not None or emails is not None:
+                connection.execute(
+                    """
+                    UPDATE new_clients
+                    SET data_revision = data_revision + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE spp_id = ?
+                    """,
+                    (spp_id,),
                 )
 
         client = self.get(spp_id)
@@ -390,6 +417,7 @@ class NewClientStorage:
                 SET status = ?, needs_review = ?,
                     telegram_claim_token = NULL,
                     telegram_claimed_at = NULL,
+                    data_revision = data_revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE spp_id = ?
                 """,
@@ -519,7 +547,9 @@ class NewClientStorage:
             cursor = connection.execute(
                 """
                 UPDATE new_clients
-                SET status = ?, needs_review = ?, updated_at = CURRENT_TIMESTAMP
+                SET status = ?, needs_review = ?,
+                    data_revision = data_revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE spp_id = ?
                 """,
                 (stored_status, needs_review, spp_id),
@@ -592,12 +622,197 @@ class NewClientStorage:
             rows = connection.execute(query, parameters).fetchall()
             return [self._to_client(connection, row) for row in rows]
 
+    def list_by_registration_date(
+        self,
+        target_date: date | str,
+    ) -> list[NewClient]:
+        """Вернуть уже сохраненные карточки за календарную дату без внешних запросов."""
+        clean_date = self._date_text(target_date)
+        if clean_date is None:  # pragma: no cover - обязательный аргумент
+            raise ValueError("Дата отчета не может быть пустой")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM new_clients
+                WHERE date(registration_date) = date(?)
+                ORDER BY name COLLATE NOCASE, spp_id
+                """,
+                (clean_date,),
+            ).fetchall()
+            return [self._to_client(connection, row) for row in rows]
+
+    def latest_attempts_for_clients(
+        self,
+        spp_ids: Iterable[int],
+    ) -> dict[int, TelegramSearchAttempt]:
+        """Вернуть последнюю Telegram-попытку для каждого указанного клиента."""
+        clean_ids = tuple(dict.fromkeys(int(spp_id) for spp_id in spp_ids))
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        query = f"""
+            SELECT attempts.client_spp_id, attempts.attempt_number,
+                   attempts.stage, attempts.result_code, attempts.error_code,
+                   attempts.created_at
+            FROM telegram_search_attempts AS attempts
+            JOIN (
+                SELECT client_spp_id, MAX(attempt_number) AS attempt_number
+                FROM telegram_search_attempts
+                WHERE client_spp_id IN ({placeholders})
+                GROUP BY client_spp_id
+            ) AS latest
+              ON latest.client_spp_id = attempts.client_spp_id
+             AND latest.attempt_number = attempts.attempt_number
+        """
+        with self._connect() as connection:
+            rows = connection.execute(query, clean_ids).fetchall()
+        return {
+            int(row["client_spp_id"]): TelegramSearchAttempt(
+                client_spp_id=int(row["client_spp_id"]),
+                attempt_number=int(row["attempt_number"]),
+                stage=str(row["stage"]),
+                result_code=str(row["result_code"]),
+                error_code=self._row_optional(row["error_code"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        }
+
+    def mark_reported(
+        self,
+        spp_ids: Iterable[int],
+        report_id: str,
+        *,
+        expected_revisions: dict[int, int] | None = None,
+        expected_reported_revisions: dict[int, int | None] | None = None,
+    ) -> None:
+        """Пометить карточки включенными в отчет без потери параллельных правок."""
+        clean_report_id = self._required(report_id, "Идентификатор отчета")
+        clean_ids = tuple(dict.fromkeys(int(spp_id) for spp_id in spp_ids))
+        if not clean_ids:
+            return
+        if expected_reported_revisions is not None and expected_revisions is None:
+            raise ValueError(
+                "Ожидаемая reported-ревизия требует ожидаемую ревизию данных"
+            )
+
+        def clean_revision(value: int, field: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field} должна быть неотрицательным целым числом")
+            return value
+
+        clean_revisions = None
+        if expected_revisions is not None:
+            clean_revisions = {
+                int(spp_id): clean_revision(revision, "Ревизия данных")
+                for spp_id, revision in expected_revisions.items()
+            }
+            missing = set(clean_ids) - clean_revisions.keys()
+            if missing:
+                raise ValueError("Не для всех клиентов указана ожидаемая ревизия")
+        clean_reported_revisions: dict[int, int | None] | None = None
+        if expected_reported_revisions is not None:
+            clean_reported_revisions = {
+                int(spp_id): (
+                    None
+                    if revision is None
+                    else clean_revision(revision, "Reported-ревизия")
+                )
+                for spp_id, revision in expected_reported_revisions.items()
+            }
+            missing = set(clean_ids) - clean_reported_revisions.keys()
+            if missing:
+                raise ValueError(
+                    "Не для всех клиентов указана ожидаемая reported-ревизия"
+                )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if clean_revisions is None:
+                connection.executemany(
+                    """
+                    UPDATE new_clients
+                    SET report_id = ?, reported_at = CURRENT_TIMESTAMP,
+                        reported_revision = data_revision
+                    WHERE spp_id = ?
+                    """,
+                    ((clean_report_id, spp_id) for spp_id in clean_ids),
+                )
+            elif clean_reported_revisions is None:
+                connection.executemany(
+                    """
+                    UPDATE new_clients
+                    SET report_id = ?, reported_at = CURRENT_TIMESTAMP,
+                        reported_revision = data_revision
+                    WHERE spp_id = ? AND data_revision = ?
+                    """,
+                    (
+                        (clean_report_id, spp_id, clean_revisions[spp_id])
+                        for spp_id in clean_ids
+                        if spp_id in clean_revisions
+                    ),
+                )
+            else:
+                connection.executemany(
+                    """
+                    UPDATE new_clients
+                    SET report_id = ?, reported_at = CURRENT_TIMESTAMP,
+                        reported_revision = data_revision
+                    WHERE spp_id = ? AND data_revision = ?
+                      AND reported_revision IS ?
+                    """,
+                    (
+                        (
+                            clean_report_id,
+                            spp_id,
+                            clean_revisions[spp_id],
+                            clean_reported_revisions[spp_id],
+                        )
+                        for spp_id in clean_ids
+                    ),
+                )
+
+    def list_report_updates(self) -> list[NewClient]:
+        """Вернуть карточки, изменившиеся после их последнего включения в отчет."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM new_clients
+                WHERE reported_at IS NOT NULL
+                  AND data_revision > COALESCE(reported_revision, -1)
+                ORDER BY registration_date, name COLLATE NOCASE, spp_id
+                """
+            ).fetchall()
+            return self._to_clients(connection, rows)
+
+    def list_unreported_through(
+        self,
+        target_date: date | str,
+    ) -> list[NewClient]:
+        """Вернуть еще не отраженные в отчетах карточки не новее указанной даты."""
+        clean_date = self._date_text(target_date)
+        if clean_date is None:  # pragma: no cover - обязательный аргумент
+            raise ValueError("Граница отчета не может быть пустой")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM new_clients
+                WHERE reported_at IS NULL
+                  AND registration_date IS NOT NULL
+                  AND date(registration_date) <= date(?)
+                ORDER BY registration_date, name COLLATE NOCASE, spp_id
+                """,
+                (clean_date,),
+            ).fetchall()
+            return [self._to_client(connection, row) for row in rows]
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(self.database_path, timeout=30)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 30000")
+            connection.execute("PRAGMA journal_mode = WAL")
             with connection:
                 yield connection
         finally:
@@ -621,6 +836,68 @@ class NewClientStorage:
             """,
             (row["spp_id"],),
         ).fetchall()
+        return cls._client_from_row(row, contacts, personalised_contacts)
+
+    @classmethod
+    def _to_clients(
+        cls,
+        connection: sqlite3.Connection,
+        rows: Iterable[sqlite3.Row],
+    ) -> list[NewClient]:
+        """Гидратировать набор клиентов тремя запросами вместо N+1."""
+        selected_rows = tuple(rows)
+        if not selected_rows:
+            return []
+        spp_ids = tuple(int(row["spp_id"]) for row in selected_rows)
+        placeholders = ", ".join("?" for _ in spp_ids)
+        contacts_by_client: dict[int, list[sqlite3.Row]] = {
+            spp_id: [] for spp_id in spp_ids
+        }
+        personalised_by_client: dict[int, list[sqlite3.Row]] = {
+            spp_id: [] for spp_id in spp_ids
+        }
+        contact_rows = connection.execute(
+            f"""
+            SELECT client_spp_id, kind, source, value
+            FROM new_client_contacts
+            WHERE client_spp_id IN ({placeholders})
+            ORDER BY client_spp_id, kind, source, position
+            """,
+            spp_ids,
+        ).fetchall()
+        for contact in contact_rows:
+            contacts_by_client[int(contact["client_spp_id"])].append(contact)
+        personalised_rows = connection.execute(
+            f"""
+            SELECT client_spp_id, kind, value
+            FROM new_client_personalised_contacts
+            WHERE client_spp_id IN ({placeholders})
+            ORDER BY client_spp_id, kind, position
+            """,
+            spp_ids,
+        ).fetchall()
+        for contact in personalised_rows:
+            personalised_by_client[int(contact["client_spp_id"])].append(
+                contact
+            )
+        return [
+            cls._client_from_row(
+                row,
+                contacts_by_client[int(row["spp_id"])],
+                personalised_by_client[int(row["spp_id"])],
+            )
+            for row in selected_rows
+        ]
+
+    @classmethod
+    def _client_from_row(
+        cls,
+        row: sqlite3.Row,
+        contacts: Iterable[sqlite3.Row],
+        personalised_contacts: Iterable[sqlite3.Row],
+    ) -> NewClient:
+        contacts = tuple(contacts)
+        personalised_contacts = tuple(personalised_contacts)
 
         def values(kind: str, source: str) -> tuple[str, ...]:
             return tuple(
@@ -665,6 +942,12 @@ class NewClientStorage:
             ),
             report_id=cls._row_optional(row["report_id"]),
             reported_at=cls._row_optional(row["reported_at"]),
+            data_revision=int(row["data_revision"]),
+            reported_revision=(
+                None
+                if row["reported_revision"] is None
+                else int(row["reported_revision"])
+            ),
         )
 
     @staticmethod
@@ -787,6 +1070,39 @@ class NewClientStorage:
             connection.execute(
                 "ALTER TABLE new_clients ADD COLUMN reported_at TEXT"
             )
+
+    @staticmethod
+    def _ensure_report_revision_columns(connection: sqlite3.Connection) -> None:
+        """Добавить ревизии и закрыть исторические уже отправленные строки."""
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(new_clients)")
+        }
+        if "data_revision" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE new_clients
+                ADD COLUMN data_revision INTEGER NOT NULL DEFAULT 0
+                CHECK (data_revision >= 0)
+                """
+            )
+        if "reported_revision" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE new_clients
+                ADD COLUMN reported_revision INTEGER
+                CHECK (
+                    reported_revision IS NULL OR reported_revision >= 0
+                )
+                """
+            )
+        connection.execute(
+            """
+            UPDATE new_clients
+            SET reported_revision = data_revision
+            WHERE reported_at IS NOT NULL AND reported_revision IS NULL
+            """
+        )
 
     @staticmethod
     def _require_telegram_claim(

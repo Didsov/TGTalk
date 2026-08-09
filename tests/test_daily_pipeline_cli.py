@@ -1,10 +1,12 @@
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.application.telegram_enrichment import EnrichmentOutcome
+from src.application.telegram_enrichment import TelegramBalanceCheckError
 from src.cli.daily_pipeline import (
     DEFAULT_DATABASE_PATH,
     DEFAULT_LIMIT,
@@ -12,7 +14,9 @@ from src.cli.daily_pipeline import (
     parse_arguments,
     print_daily_summary,
     run_daily_pipeline,
+    _run,
 )
+from src.integrations.telegram.report_sender import ReportDispatchResult
 from src.storage import ProcessingStatus
 
 
@@ -139,6 +143,327 @@ class DailyPipelineTests(unittest.IsolatedAsyncioTestCase):
                 await run_daily_pipeline("daily.db")
 
         enrichment.assert_not_awaited()
+
+    async def test_cli_continues_when_balance_notification_fails(self) -> None:
+        pipeline_result = DailyPipelineResult(
+            target_date=date(2026, 8, 8),
+            collected_cards=1,
+            enrichment_outcomes=(),
+        )
+        dispatch = ReportDispatchResult(
+            report_id=1,
+            cohort_date=date.today() - timedelta(days=7),
+            clients_count=2,
+            sent=1,
+            failed=0,
+        )
+        report_bot = Mock()
+        report_bot.__aenter__ = AsyncMock(return_value=report_bot)
+        report_bot.__aexit__ = AsyncMock(return_value=None)
+
+        async def pipeline(*args, **kwargs):
+            await kwargs["balance_observer"](9)
+            return pipeline_result
+
+        arguments = SimpleNamespace(
+            database=Path("daily.db"),
+            date=None,
+            limit=10,
+            timeout=45,
+        )
+        settings = SimpleNamespace(
+            token="test-token",
+            bootstrap_admin_ids=frozenset({100}),
+            low_query_threshold=10,
+            report_retention_days=None,
+        )
+        reporting_storage = Mock()
+        reporting_storage.start_pipeline_run.return_value = SimpleNamespace(id=31)
+        with (
+            patch("src.cli.daily_pipeline.Bot", return_value=report_bot),
+            patch(
+                "src.cli.daily_pipeline.load_report_bot_settings",
+                return_value=settings,
+            ),
+            patch(
+                "src.cli.daily_pipeline.ReportingStorage",
+                return_value=reporting_storage,
+            ),
+            patch("src.cli.daily_pipeline.NewClientStorage"),
+            patch(
+                "src.cli.daily_pipeline.run_daily_pipeline",
+                new=AsyncMock(side_effect=pipeline),
+            ),
+            patch(
+                "src.cli.daily_pipeline.observe_query_balance",
+                new=AsyncMock(side_effect=RuntimeError("notification unavailable")),
+            ) as observe,
+            patch(
+                "src.cli.daily_pipeline.send_daily_report",
+                new=AsyncMock(return_value=dispatch),
+            ) as send_report,
+            patch(
+                "src.cli.daily_pipeline.retry_failed_report_deliveries",
+                new=AsyncMock(return_value=()),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_late_update_reports",
+                new=AsyncMock(return_value=()),
+            ),
+            patch("src.cli.daily_pipeline.print_daily_summary"),
+        ):
+            result = await _run(arguments)
+
+        observe.assert_awaited_once()
+        send_report.assert_awaited_once()
+        self.assertEqual(
+            send_report.await_args.args[3],
+            date.today() - timedelta(days=7),
+        )
+        self.assertEqual(result.report_dispatch, dispatch)
+        reporting_storage.start_pipeline_run.assert_called_once_with(
+            date.today() - timedelta(days=1)
+        )
+        finish_options = reporting_storage.finish_pipeline_run.call_args.kwargs
+        self.assertEqual(finish_options["status"], "completed")
+        self.assertEqual(finish_options["collected_cards"], 1)
+        self.assertEqual(finish_options["available_queries"], 9)
+        self.assertEqual(finish_options["processing_status_counts"], {})
+
+    async def test_cli_still_sends_sql_report_when_collection_fails(self) -> None:
+        dispatch = ReportDispatchResult(
+            report_id=2,
+            cohort_date=date.today() - timedelta(days=7),
+            clients_count=1,
+            sent=1,
+            failed=0,
+        )
+        report_bot = Mock()
+        report_bot.__aenter__ = AsyncMock(return_value=report_bot)
+        report_bot.__aexit__ = AsyncMock(return_value=None)
+        arguments = SimpleNamespace(
+            database=Path("daily.db"), date=None, limit=10, timeout=45
+        )
+        settings = SimpleNamespace(
+            token="test-token",
+            bootstrap_admin_ids=frozenset({100}),
+            low_query_threshold=10,
+            report_retention_days=None,
+        )
+        reporting_storage = Mock()
+        reporting_storage.start_pipeline_run.return_value = SimpleNamespace(id=32)
+        with (
+            patch("src.cli.daily_pipeline.Bot", return_value=report_bot),
+            patch(
+                "src.cli.daily_pipeline.load_report_bot_settings",
+                return_value=settings,
+            ),
+            patch(
+                "src.cli.daily_pipeline.ReportingStorage",
+                return_value=reporting_storage,
+            ),
+            patch("src.cli.daily_pipeline.NewClientStorage"),
+            patch(
+                "src.cli.daily_pipeline.run_daily_pipeline",
+                new=AsyncMock(side_effect=RuntimeError("SBIS unavailable")),
+            ),
+            patch(
+                "src.cli.daily_pipeline.notify_admins", new=AsyncMock()
+            ) as notify,
+            patch(
+                "src.cli.daily_pipeline.retry_failed_report_deliveries",
+                new=AsyncMock(return_value=()),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_late_update_reports",
+                new=AsyncMock(return_value=()),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_daily_report",
+                new=AsyncMock(return_value=dispatch),
+            ) as send_report,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SBIS unavailable"):
+                await _run(arguments)
+
+        notify.assert_awaited_once()
+        send_report.assert_awaited_once()
+        finish_options = reporting_storage.finish_pipeline_run.call_args.kwargs
+        self.assertEqual(finish_options["status"], "failed")
+        self.assertEqual(finish_options["error_code"], "RuntimeError")
+
+    async def test_balance_failure_has_separate_alert_and_pipeline_stage(self) -> None:
+        dispatch = ReportDispatchResult(
+            report_id=3,
+            cohort_date=date.today() - timedelta(days=7),
+            clients_count=0,
+            sent=0,
+            failed=0,
+        )
+        report_bot = Mock()
+        report_bot.__aenter__ = AsyncMock(return_value=report_bot)
+        report_bot.__aexit__ = AsyncMock(return_value=None)
+        arguments = SimpleNamespace(
+            database=Path("daily.db"), date=None, limit=10, timeout=45
+        )
+        settings = SimpleNamespace(
+            token="test-token",
+            bootstrap_admin_ids=frozenset({100}),
+            low_query_threshold=10,
+            report_retention_days=None,
+        )
+        reporting_storage = Mock()
+        reporting_storage.start_pipeline_run.return_value = SimpleNamespace(id=33)
+        with (
+            patch("src.cli.daily_pipeline.Bot", return_value=report_bot),
+            patch(
+                "src.cli.daily_pipeline.load_report_bot_settings",
+                return_value=settings,
+            ),
+            patch(
+                "src.cli.daily_pipeline.ReportingStorage",
+                return_value=reporting_storage,
+            ),
+            patch("src.cli.daily_pipeline.NewClientStorage"),
+            patch(
+                "src.cli.daily_pipeline.run_daily_pipeline",
+                new=AsyncMock(
+                    side_effect=TelegramBalanceCheckError("balance unavailable")
+                ),
+            ),
+            patch(
+                "src.cli.daily_pipeline.notify_admins", new=AsyncMock()
+            ),
+            patch(
+                "src.cli.daily_pipeline.notify_balance_check_failed",
+                new=AsyncMock(),
+            ) as notify_balance_failed,
+            patch(
+                "src.cli.daily_pipeline.retry_failed_report_deliveries",
+                new=AsyncMock(return_value=()),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_late_update_reports",
+                new=AsyncMock(return_value=()),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_daily_report",
+                new=AsyncMock(return_value=dispatch),
+            ),
+        ):
+            with self.assertRaises(TelegramBalanceCheckError):
+                await _run(arguments)
+
+        notify_balance_failed.assert_awaited_once_with(
+            report_bot,
+            reporting_storage,
+            (100,),
+        )
+        finish_options = reporting_storage.finish_pipeline_run.call_args.kwargs
+        self.assertEqual(finish_options["status"], "failed")
+        self.assertEqual(finish_options["error_stage"], "telegram_balance")
+
+    async def test_alerts_failed_deliveries_and_cleans_expired_snapshots(
+        self,
+    ) -> None:
+        outcomes = (
+            EnrichmentOutcome(
+                client_spp_id=1,
+                status=ProcessingStatus.PROCESSED,
+                phones=(),
+                emails=(),
+                stage="done",
+                result_code="found",
+            ),
+            EnrichmentOutcome(
+                client_spp_id=2,
+                status=ProcessingStatus.SKIPPED,
+                phones=(),
+                emails=(),
+                stage="done",
+                result_code="not_found",
+            ),
+        )
+        pipeline_result = DailyPipelineResult(
+            target_date=date(2026, 8, 8),
+            collected_cards=4,
+            enrichment_outcomes=outcomes,
+        )
+        report_date = date.today() - timedelta(days=7)
+
+        def dispatch(report_id: int, failed: int) -> ReportDispatchResult:
+            return ReportDispatchResult(
+                report_id=report_id,
+                cohort_date=report_date,
+                clients_count=1,
+                sent=0,
+                failed=failed,
+            )
+
+        report_bot = Mock()
+        report_bot.__aenter__ = AsyncMock(return_value=report_bot)
+        report_bot.__aexit__ = AsyncMock(return_value=None)
+        arguments = SimpleNamespace(
+            database=Path("daily.db"), date=None, limit=10, timeout=45
+        )
+        settings = SimpleNamespace(
+            token="test-token",
+            bootstrap_admin_ids=frozenset({100}),
+            low_query_threshold=10,
+            report_retention_days=90,
+        )
+        reporting_storage = Mock()
+        reporting_storage.start_pipeline_run.return_value = SimpleNamespace(id=34)
+        before = datetime.now(timezone.utc) - timedelta(days=90, seconds=1)
+        with (
+            patch("src.cli.daily_pipeline.Bot", return_value=report_bot),
+            patch(
+                "src.cli.daily_pipeline.load_report_bot_settings",
+                return_value=settings,
+            ),
+            patch(
+                "src.cli.daily_pipeline.ReportingStorage",
+                return_value=reporting_storage,
+            ),
+            patch("src.cli.daily_pipeline.NewClientStorage"),
+            patch(
+                "src.cli.daily_pipeline.run_daily_pipeline",
+                new=AsyncMock(return_value=pipeline_result),
+            ),
+            patch(
+                "src.cli.daily_pipeline.notify_admins", new=AsyncMock()
+            ) as notify,
+            patch(
+                "src.cli.daily_pipeline.retry_failed_report_deliveries",
+                new=AsyncMock(return_value=(dispatch(1, 1),)),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_late_update_reports",
+                new=AsyncMock(return_value=(dispatch(2, 2),)),
+            ),
+            patch(
+                "src.cli.daily_pipeline.send_daily_report",
+                new=AsyncMock(return_value=dispatch(3, 3)),
+            ),
+            patch("src.cli.daily_pipeline.print_daily_summary"),
+        ):
+            await _run(arguments)
+        after = datetime.now(timezone.utc) - timedelta(days=90) + timedelta(
+            seconds=1
+        )
+
+        alert = notify.await_args.args[3]
+        self.assertIn("Не доставлено: 6", alert)
+        cutoff = reporting_storage.delete_report_runs_created_before.call_args.args[0]
+        self.assertIsNotNone(cutoff.tzinfo)
+        self.assertGreaterEqual(cutoff, before)
+        self.assertLessEqual(cutoff, after)
+        finish_options = reporting_storage.finish_pipeline_run.call_args.kwargs
+        self.assertEqual(finish_options["status"], "completed")
+        self.assertEqual(
+            finish_options["processing_status_counts"],
+            {"processed": 1, "skipped": 1},
+        )
 
 
 class SummaryTests(unittest.TestCase):

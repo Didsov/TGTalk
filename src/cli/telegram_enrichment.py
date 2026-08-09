@@ -9,9 +9,10 @@ import sys
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from src.application.telegram_enrichment import (
+    BalanceObserver,
     EnrichmentOutcome,
     process_first_clients,
 )
@@ -93,6 +94,7 @@ async def run_enrichment(
     limit: int,
     timeout: float = DEFAULT_TIMEOUT,
     write: bool = False,
+    balance_observer: BalanceObserver | None = None,
 ) -> list[EnrichmentOutcome]:
     """Открыть Telegram, обработать очередь и гарантированно закрыть клиент."""
     loadEnvironment()
@@ -104,13 +106,18 @@ async def run_enrichment(
 
     telegram_client = await openTg()
     try:
+        processing_options: dict[str, Any] = {
+            "limit": limit,
+            "write": write,
+            "timeout": timeout,
+        }
+        if balance_observer is not None:
+            processing_options["balance_observer"] = balance_observer
         return await process_first_clients(
             storage,
             telegram_client,
             bot_username,
-            limit=limit,
-            write=write,
-            timeout=timeout,
+            **processing_options,
         )
     finally:
         await closeTg(telegram_client)

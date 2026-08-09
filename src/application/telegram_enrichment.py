@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -30,6 +31,7 @@ from src.storage.new_clients import NewClient, NewClientStorage, ProcessingStatu
 
 
 ReportLoader = Callable[[str], Awaitable[str]]
+BalanceObserver = Callable[[int], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,10 @@ class EnrichmentOutcome:
 
 class AvailableQueriesExhausted(RuntimeError):
     """Платный запрос не отправлен из-за исчерпанного баланса."""
+
+
+class TelegramBalanceCheckError(RuntimeError):
+    """Не удалось получить остаток запросов у поискового Telegram-бота."""
 
 
 async def enrich_client(
@@ -440,15 +446,22 @@ async def process_first_clients(
     write: bool = False,
     timeout: float = 30,
     report_loader: ReportLoader = download_report_text,
+    balance_observer: BalanceObserver | None = None,
 ) -> list[EnrichmentOutcome]:
     """Последовательно обработать первые N записей очереди."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError("limit должен быть положительным целым числом")
-    available_queries = await getAvailableQueries(
-        telegram_client,
-        bot_username,
-        timeout=timeout,
-    )
+    try:
+        available_queries = await getAvailableQueries(
+            telegram_client,
+            bot_username,
+            timeout=timeout,
+        )
+    except Exception as error:
+        raise TelegramBalanceCheckError(
+            "Не удалось получить остаток запросов поискового Telegram-бота"
+        ) from error
+    await _observe_balance(balance_observer, available_queries)
     dry_run_clients = (
         iter(storage.list_for_processing(limit=limit)) if not write else None
     )
@@ -541,12 +554,29 @@ async def process_first_clients(
             0,
             available_queries - outcome.requests_spent,
         )
+        await _observe_balance(balance_observer, available_queries)
         if available_queries == 0:
             notify_queries_exhausted()
             break
         if pause_batch:
             break
     return outcomes
+
+
+async def _observe_balance(
+    observer: BalanceObserver | None,
+    available_queries: int,
+) -> None:
+    """Передать баланс наблюдателю, не прерывая основной поиск при сбое уведомления."""
+    if observer is None:
+        return
+    try:
+        await observer(available_queries)
+    except Exception as error:
+        logging.getLogger(__name__).warning(
+            "Не удалось отправить состояние баланса: %s",
+            type(error).__name__,
+        )
 
 
 async def _load_report(
