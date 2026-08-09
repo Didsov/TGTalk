@@ -94,7 +94,7 @@ Backup saved and verified: D:\INNtoPhone-Backups\inntophone-backup-....zip
 ```powershell
 $action = New-ScheduledTaskAction `
   -Execute "powershell.exe" `
-  -Argument '-NoProfile -ExecutionPolicy Bypass -File "D:\GIT\INNtoPhone\scripts\pull_server_backup.ps1" -Server "АДРЕС_СЕРВЕРА" -RemoteUser "inntophone" -LocalBackupDirectory "D:\INNtoPhone-Backups" -RemoteKeep 7 -LocalKeep 30'
+  -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "D:\GIT\INNtoPhone\scripts\pull_server_backup.ps1" -Server "inntophone-server" -RemoteUser "inntophone" -LocalBackupDirectory "D:\INNtoPhone-Backups" -RemoteKeep 3 -LocalKeep 7'
 
 $trigger = New-ScheduledTaskTrigger -Daily -At 12:00
 $settings = New-ScheduledTaskSettingsSet `
