@@ -38,7 +38,7 @@ from src.storage import NewClientStorage, ReportingStorage
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "clients.db"
 DEFAULT_LIMIT = 100
 DEFAULT_TIMEOUT = 45.0
-REPORT_DELTA = 2
+REPORT_DELTA = 7
 PipelineProgressObserver = Callable[[str, int], None]
 
 
