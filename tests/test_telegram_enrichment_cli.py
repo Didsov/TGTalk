@@ -42,6 +42,7 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(arguments.limit, 3)
         self.assertEqual(arguments.timeout, 30.0)
         self.assertFalse(arguments.write)
+        self.assertIsNone(arguments.report_archive)
 
     def test_parses_database_timeout_and_write_mode(self) -> None:
         arguments = parse_arguments(
@@ -120,13 +121,14 @@ class RunEnrichmentTests(unittest.IsolatedAsyncioTestCase):
         validate_report_hosts.assert_called_once_with()
         open_tg.assert_awaited_once_with()
         require_setting.assert_called_once_with("TELEGRAM_TARGET_BOT")
-        process.assert_awaited_once_with(
-            storage,
-            telegram_client,
-            "@stub_search_bot",
-            limit=2,
-            write=False,
-            timeout=7.5,
+        process.assert_awaited_once()
+        self.assertEqual(process.await_args.args, (storage, telegram_client, "@stub_search_bot"))
+        self.assertEqual(process.await_args.kwargs["limit"], 2)
+        self.assertFalse(process.await_args.kwargs["write"])
+        self.assertEqual(process.await_args.kwargs["timeout"], 7.5)
+        self.assertEqual(
+            process.await_args.kwargs["report_archiver"].directory,
+            database_path.resolve().parent / "telegram_reports",
         )
         close_tg.assert_awaited_once_with(telegram_client)
         self.assertEqual(result, expected)

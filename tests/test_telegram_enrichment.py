@@ -79,6 +79,44 @@ NO_PHONE_REPORT = (
 
 
 class EnrichClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_archives_downloaded_report_with_original_query(self) -> None:
+        archiver = Mock()
+        with patch(
+            "src.application.telegram_enrichment.sendQueryAndWait",
+            new=AsyncMock(return_value=message(url="http://localhost/r/phone")),
+        ):
+            await enrich_client(
+                client(),
+                Mock(),
+                report_loader=AsyncMock(return_value=PHONE_REPORT),
+                report_archiver=archiver,
+            )
+
+        values = archiver.record.call_args.kwargs
+        self.assertEqual(values["client_spp_id"], 101)
+        self.assertEqual(values["query_kind"], "inn")
+        self.assertEqual(values["query_text"], f"/inn {SOURCE_INN}")
+        self.assertEqual(values["outcome"], "report_saved")
+        self.assertEqual(values["report_text"], PHONE_REPORT)
+
+    async def test_archives_timeout_without_report(self) -> None:
+        archiver = Mock()
+        with patch(
+            "src.application.telegram_enrichment.sendQueryAndWait",
+            new=AsyncMock(side_effect=TimeoutError),
+        ):
+            outcome = await enrich_client(
+                client(),
+                Mock(),
+                report_archiver=archiver,
+            )
+
+        self.assertEqual(outcome.error_code, "telegram_timeout")
+        values = archiver.record.call_args.kwargs
+        self.assertEqual(values["query_text"], f"/inn {SOURCE_INN}")
+        self.assertEqual(values["outcome"], "no_response")
+        self.assertIsNone(values["report_text"])
+
     async def test_processes_phone_found_in_inn_report(self) -> None:
         with patch(
             "src.application.telegram_enrichment.sendQueryAndWait",

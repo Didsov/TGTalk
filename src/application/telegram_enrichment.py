@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from telethon.errors import FloodWaitError
@@ -32,6 +32,10 @@ from src.storage.new_clients import NewClient, NewClientStorage, ProcessingStatu
 
 ReportLoader = Callable[[str], Awaitable[str]]
 BalanceObserver = Callable[[int], Awaitable[None]]
+
+
+class ReportArchiver(Protocol):
+    def record(self, **values: Any) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ async def enrich_client(
     timeout: float = 30,
     report_loader: ReportLoader = download_report_text,
     available_queries: int | None = None,
+    report_archiver: ReportArchiver | None = None,
 ) -> EnrichmentOutcome:
     """Обогатить клиента и вернуть фактическое число платных запросов."""
     requests_spent = 0
@@ -88,6 +93,7 @@ async def enrich_client(
         timeout=timeout,
         report_loader=report_loader,
         query_sender=paid_query,
+        report_archiver=report_archiver,
     )
     return replace(outcome, requests_spent=requests_spent)
 
@@ -99,6 +105,7 @@ async def _enrich_client(
     timeout: float,
     report_loader: ReportLoader,
     query_sender: Callable[..., Awaitable[Any]],
+    report_archiver: ReportArchiver | None,
 ) -> EnrichmentOutcome:
     """Искать по ИНН директора, почтам СБИС, затем ФИО и дате рождения."""
     phones = list(client.telegram_phones)
@@ -134,17 +141,20 @@ async def _enrich_client(
             "director_name_missing",
         )
 
+    inn_query = f"/inn {client.director_inn}"
     try:
         inn_response = await query_sender(
-            conversation, f"/inn {client.director_inn}", timeout=timeout
+            conversation, inn_query, timeout=timeout
         )
     except AvailableQueriesExhausted:
         return _queries_exhausted(client, phones, emails, "inn_query")
     except FloodWaitError as error:
+        _archive_attempt(report_archiver, client, "inn", inn_query, "flood_wait")
         return _flood_wait_outcome(
             client, phones, emails, "inn_query", error
         )
     except TimeoutError:
+        _archive_attempt(report_archiver, client, "inn", inn_query, "no_response")
         return _outcome(
             client,
             ProcessingStatus.RETRY_REQUIRED,
@@ -157,13 +167,20 @@ async def _enrich_client(
 
     response_kind = classifyBotResponse(inn_response)
     first_report = None
+    if response_kind is BotResponseKind.NOT_FOUND:
+        _archive_attempt(
+            report_archiver, client, "inn", inn_query, "not_found", response=inn_response
+        )
     if response_kind is BotResponseKind.RETRYABLE_ERROR:
+        _archive_attempt(report_archiver, client, "inn", inn_query, "retryable_response", response=inn_response)
         return _temporary_bot_response(client, phones, emails, "inn_query")
     if response_kind is BotResponseKind.UNKNOWN:
+        _archive_attempt(report_archiver, client, "inn", inn_query, "unknown_response", response=inn_response)
         return _manual_review(client, phones, emails, "inn_query", "unknown_response")
     if response_kind is not BotResponseKind.NOT_FOUND:
         first_url = await extractReportUrlAsync(inn_response)
         if first_url is None:
+            _archive_attempt(report_archiver, client, "inn", inn_query, "report_url_missing", response=inn_response)
             return _manual_review(
                 client, phones, emails, "inn_query", "report_url_missing"
             )
@@ -172,7 +189,9 @@ async def _enrich_client(
             client, first_url, phones, emails, "inn_report_download", report_loader
         )
         if failure is not None:
+            _archive_attempt(report_archiver, client, "inn", inn_query, "report_download_failed", response=inn_response)
             return failure
+        _archive_attempt(report_archiver, client, "inn", inn_query, "report_saved", report_text=first_text, response=inn_response)
         if first_text is None or not first_text.strip():
             return _manual_review(
                 client, phones, emails, "inn_report_parse", "empty_report"
@@ -204,17 +223,20 @@ async def _enrich_client(
         client.personalised_emails[0] if client.personalised_emails else None
     )
     if personalised_email is not None:
+        email_query = personalised_email
         try:
             email_response = await query_sender(
-                conversation, personalised_email, timeout=timeout
+                conversation, email_query, timeout=timeout
             )
         except AvailableQueriesExhausted:
             return _queries_exhausted(client, phones, emails, "email_query")
         except FloodWaitError as error:
+            _archive_attempt(report_archiver, client, "email", email_query, "flood_wait")
             return _flood_wait_outcome(
                 client, phones, emails, "email_query", error
             )
         except TimeoutError:
+            _archive_attempt(report_archiver, client, "email", email_query, "no_response")
             return _outcome(
                 client,
                 ProcessingStatus.RETRY_REQUIRED,
@@ -226,15 +248,27 @@ async def _enrich_client(
             )
 
         response_kind = classifyBotResponse(email_response)
+        if response_kind is BotResponseKind.NOT_FOUND:
+            _archive_attempt(
+                report_archiver,
+                client,
+                "email",
+                email_query,
+                "not_found",
+                response=email_response,
+            )
         if response_kind is BotResponseKind.RETRYABLE_ERROR:
+            _archive_attempt(report_archiver, client, "email", email_query, "retryable_response", response=email_response)
             return _temporary_bot_response(client, phones, emails, "email_query")
         if response_kind is BotResponseKind.UNKNOWN:
+            _archive_attempt(report_archiver, client, "email", email_query, "unknown_response", response=email_response)
             return _manual_review(
                 client, phones, emails, "email_query", "unknown_response"
             )
         if response_kind is not BotResponseKind.NOT_FOUND:
             email_url = await extractReportUrlAsync(email_response)
             if email_url is None:
+                _archive_attempt(report_archiver, client, "email", email_query, "report_url_missing", response=email_response)
                 return _manual_review(
                     client, phones, emails, "email_query", "report_url_missing"
                 )
@@ -247,7 +281,9 @@ async def _enrich_client(
                 report_loader,
             )
             if failure is not None:
+                _archive_attempt(report_archiver, client, "email", email_query, "report_download_failed", response=email_response)
                 return failure
+            _archive_attempt(report_archiver, client, "email", email_query, "report_saved", report_text=email_text, response=email_response)
             if email_text is None or not email_text.strip():
                 return _manual_review(
                     client, phones, emails, "email_report_parse", "empty_report"
@@ -315,10 +351,12 @@ async def _enrich_client(
     except AvailableQueriesExhausted:
         return _queries_exhausted(client, phones, emails, "person_query")
     except FloodWaitError as error:
+        _archive_attempt(report_archiver, client, "person", person_query, "flood_wait")
         return _flood_wait_outcome(
             client, phones, emails, "person_query", error
         )
     except TimeoutError:
+        _archive_attempt(report_archiver, client, "person", person_query, "no_response")
         return _outcome(
             client,
             ProcessingStatus.RETRY_REQUIRED,
@@ -331,6 +369,7 @@ async def _enrich_client(
 
     response_kind = classifyBotResponse(country_response)
     if response_kind is BotResponseKind.NOT_FOUND:
+        _archive_attempt(report_archiver, client, "person", person_query, "not_found", response=country_response)
         return _outcome(
             client,
             ProcessingStatus.SKIPPED,
@@ -340,8 +379,10 @@ async def _enrich_client(
             "person_not_found",
         )
     if response_kind is BotResponseKind.RETRYABLE_ERROR:
+        _archive_attempt(report_archiver, client, "person", person_query, "retryable_response", response=country_response)
         return _temporary_bot_response(client, phones, emails, "person_query")
     if response_kind is BotResponseKind.UNKNOWN:
+        _archive_attempt(report_archiver, client, "person", person_query, "unknown_response", response=country_response)
         return _manual_review(
             client, phones, emails, "person_query", "unknown_response"
         )
@@ -351,10 +392,12 @@ async def _enrich_client(
             conversation, country_response, timeout=timeout
         )
     except FloodWaitError as error:
+        _archive_attempt(report_archiver, client, "person", person_query, "flood_wait")
         return _flood_wait_outcome(
             client, phones, emails, "country_selection", error
         )
     except TimeoutError:
+        _archive_attempt(report_archiver, client, "person", person_query, "no_response")
         return _outcome(
             client,
             ProcessingStatus.RETRY_REQUIRED,
@@ -365,12 +408,14 @@ async def _enrich_client(
             "telegram_timeout",
         )
     except (LookupError, ValueError):
+        _archive_attempt(report_archiver, client, "person", person_query, "country_button_missing", response=country_response)
         return _manual_review(
             client, phones, emails, "country_selection", "russia_button_missing"
         )
 
     response_kind = classifyBotResponse(person_response)
     if response_kind is BotResponseKind.NOT_FOUND:
+        _archive_attempt(report_archiver, client, "person", person_query, "not_found", response=person_response)
         return _outcome(
             client,
             ProcessingStatus.SKIPPED,
@@ -380,14 +425,17 @@ async def _enrich_client(
             "person_not_found",
         )
     if response_kind is BotResponseKind.RETRYABLE_ERROR:
+        _archive_attempt(report_archiver, client, "person", person_query, "retryable_response", response=person_response)
         return _temporary_bot_response(client, phones, emails, "person_result")
     if response_kind is BotResponseKind.UNKNOWN:
+        _archive_attempt(report_archiver, client, "person", person_query, "unknown_response", response=person_response)
         return _manual_review(
             client, phones, emails, "person_result", "unknown_response"
         )
 
     second_url = await extractReportUrlAsync(person_response)
     if second_url is None:
+        _archive_attempt(report_archiver, client, "person", person_query, "report_url_missing", response=person_response)
         return _manual_review(
             client, phones, emails, "person_result", "report_url_missing"
         )
@@ -400,7 +448,9 @@ async def _enrich_client(
         report_loader,
     )
     if failure is not None:
+        _archive_attempt(report_archiver, client, "person", person_query, "report_download_failed", response=person_response)
         return failure
+    _archive_attempt(report_archiver, client, "person", person_query, "report_saved", report_text=second_text, response=person_response)
     if second_text is None or not second_text.strip():
         return _manual_review(
             client, phones, emails, "person_report_parse", "empty_report"
@@ -447,6 +497,7 @@ async def process_first_clients(
     timeout: float = 30,
     report_loader: ReportLoader = download_report_text,
     balance_observer: BalanceObserver | None = None,
+    report_archiver: ReportArchiver | None = None,
 ) -> list[EnrichmentOutcome]:
     """Последовательно обработать первые N записей очереди."""
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -494,6 +545,7 @@ async def process_first_clients(
                     timeout=timeout,
                     report_loader=report_loader,
                     available_queries=available_queries,
+                    report_archiver=report_archiver,
                 )
         except FloodWaitError as error:
             outcome = _flood_wait_outcome(
@@ -614,6 +666,40 @@ def _director_name(client: NewClient) -> str | None:
     )
     clean_parts = [part.strip() for part in parts if part and part.strip()]
     return " ".join(clean_parts) if len(clean_parts) >= 2 else None
+
+
+def _archive_attempt(
+    archiver: ReportArchiver | None,
+    client: NewClient,
+    query_kind: str,
+    query_text: str,
+    outcome: str,
+    *,
+    report_text: str | None = None,
+    response: Any | None = None,
+) -> None:
+    if archiver is None:
+        return
+    response_text = None
+    if response is not None:
+        response_text = getattr(response, "raw_text", None) or getattr(response, "text", None)
+    try:
+        archiver.record(
+            client_spp_id=client.spp_id,
+            client_name=client.name,
+            query_kind=query_kind,
+            query_text=query_text,
+            outcome=outcome,
+            report_text=report_text,
+            response_text=response_text,
+        )
+    except Exception as error:
+        logging.getLogger(__name__).warning(
+            "Не удалось сохранить архив Telegram-отчёта: client_spp_id=%s, stage=%s, error=%s",
+            client.spp_id,
+            query_kind,
+            type(error).__name__,
+        )
 
 
 def _extend_unique(target: list[str], values: tuple[str, ...]) -> None:

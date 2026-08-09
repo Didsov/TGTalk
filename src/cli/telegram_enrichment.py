@@ -20,6 +20,7 @@ from src.config import PROJECT_ROOT, loadEnvironment, requireSetting
 from src.integrations.telegram.bot_client import closeTg, openTg
 from src.integrations.telegram.report_downloader import allowed_report_hosts
 from src.storage import NewClientStorage, ProcessingStatus, STATUS_LABELS
+from src.storage.telegram_reports import TelegramReportArchive
 
 
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "clients.db"
@@ -85,6 +86,14 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="сохранить контакты, статусы и попытки в SQLite",
     )
+    parser.add_argument(
+        "--report-archive",
+        type=Path,
+        default=None,
+        help=(
+            "каталог архива ответов; по умолчанию telegram_reports рядом с SQLite"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -95,6 +104,7 @@ async def run_enrichment(
     timeout: float = DEFAULT_TIMEOUT,
     write: bool = False,
     balance_observer: BalanceObserver | None = None,
+    report_archive_path: str | Path | None = None,
 ) -> list[EnrichmentOutcome]:
     """Открыть Telegram, обработать очередь и гарантированно закрыть клиент."""
     loadEnvironment()
@@ -103,6 +113,12 @@ async def run_enrichment(
 
     storage = NewClientStorage(database_path)
     storage.initialize()
+    archive_path = (
+        Path(report_archive_path)
+        if report_archive_path is not None
+        else Path(database_path).resolve().parent / "telegram_reports"
+    )
+    report_archiver = TelegramReportArchive(archive_path)
 
     telegram_client = await openTg()
     try:
@@ -110,6 +126,7 @@ async def run_enrichment(
             "limit": limit,
             "write": write,
             "timeout": timeout,
+            "report_archiver": report_archiver,
         }
         if balance_observer is not None:
             processing_options["balance_observer"] = balance_observer
@@ -163,13 +180,20 @@ def print_summary(
 
 
 async def _run(arguments: argparse.Namespace) -> list[EnrichmentOutcome]:
+    archive_path = (
+        arguments.report_archive
+        if arguments.report_archive is not None
+        else arguments.database.resolve().parent / "telegram_reports"
+    )
     outcomes = await run_enrichment(
         arguments.database,
         limit=arguments.limit,
         timeout=arguments.timeout,
         write=arguments.write,
+        report_archive_path=archive_path,
     )
     print_summary(outcomes, write=arguments.write)
+    print(f"Архив ответов Telegram: {archive_path.resolve()}")
     return outcomes
 
 
