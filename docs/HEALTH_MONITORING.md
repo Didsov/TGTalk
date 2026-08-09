@@ -46,43 +46,8 @@ python -m src.cli.healthcheck --database .\data\clients.db --no-notify
 
 ## systemd-таймер
 
-Пример `/etc/systemd/system/inntophone-health.service`:
-
-```ini
-[Unit]
-Description=INNtoPhone integration healthcheck
-
-[Service]
-Type=oneshot
-User=inntophone
-WorkingDirectory=/opt/inntophone
-EnvironmentFile=/opt/inntophone/.env
-ExecStart=/opt/inntophone/.venv/bin/python -m src.cli.healthcheck --database /opt/inntophone/data/clients.db
-```
-
-Пример `/etc/systemd/system/inntophone-health.timer`:
-
-```ini
-[Unit]
-Description=Run INNtoPhone healthcheck every 30 minutes
-
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=30min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-Активация и просмотр журнала:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now inntophone-health.timer
-systemctl list-timers --all | grep inntophone
-journalctl -u inntophone-health.service -n 100
-```
-
-Пути, пользователя и Python virtualenv в unit-файле нужно заменить на значения
-конкретного сервера.
+Пошаговое создание `inntophone-health.service` и
+`inntophone-health.timer` через `nano`, их активация и просмотр журналов описаны
+в разделе «Постоянный запуск через systemd» файла
+[`SERVER_OPERATIONS.md`](SERVER_OPERATIONS.md). Там же находятся unit-файлы бота
+отчетов и ежедневного конвейера.
