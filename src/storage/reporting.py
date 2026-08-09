@@ -1120,8 +1120,10 @@ class ReportingStorage:
         report_id: int,
         user_id: int,
         part_count: int,
+        *,
+        allow_single_append: bool = False,
     ) -> None:
-        """Зафиксировать количество частей доставки без права его изменения."""
+        """Зафиксировать части; опционально добавить один новый хвостовой файл."""
         clean_report_id = self._positive_int(report_id, "ID отчета")
         clean_user_id = self._user_id(user_id)
         clean_part_count = self._positive_int(part_count, "Количество частей")
@@ -1142,6 +1144,24 @@ class ReportingStorage:
             existing_indexes = tuple(int(row["part_index"]) for row in rows)
             if existing_indexes:
                 if existing_indexes != expected_indexes:
+                    if (
+                        allow_single_append
+                        and existing_indexes
+                        == tuple(range(clean_part_count - 1))
+                    ):
+                        connection.execute(
+                            """
+                            INSERT INTO report_delivery_parts (
+                                report_id, user_id, part_index, status
+                            ) VALUES (?, ?, ?, 'pending')
+                            """,
+                            (
+                                clean_report_id,
+                                clean_user_id,
+                                clean_part_count - 1,
+                            ),
+                        )
+                        return
                     raise ValueError(
                         "Количество частей доставки уже зафиксировано"
                     )

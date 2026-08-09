@@ -20,16 +20,23 @@ from src.integrations.telegram.report_bot import (
     CALLBACK_ADMIN_CANCEL_PREFIX,
     CALLBACK_ADMIN_CONFIRM_PREFIX,
     CALLBACK_EXCEL_PREFIX,
+    CALLBACK_REPORT_DAY_PREFIX,
+    CALLBACK_REPORT_MONTH_PREFIX,
     ReportBotService,
     admin_menu,
     create_report_router,
     load_report_bot_settings,
     menu_keyboard,
     parse_bootstrap_admin_ids,
+    report_dates_keyboard,
     user_menu,
 )
 from src.integrations.telegram.report_sender import report_download_keyboard
-from src.storage.new_clients import NewClient, ProcessingStatus
+from src.storage.new_clients import (
+    NewClient,
+    ProcessingStatus,
+    RegistrationDayStats,
+)
 
 
 def make_message(
@@ -192,6 +199,7 @@ def make_service(
 
     client_storage = MagicMock()
     client_storage.list_by_registration_date.return_value = list(clients)
+    client_storage.registration_date_stats.return_value = ()
     client_storage.latest_attempts_for_clients.return_value = {}
     service = ReportBotService(
         access,
@@ -335,6 +343,33 @@ class CliTests(unittest.TestCase):
 
 
 class KeyboardTests(unittest.TestCase):
+    def test_report_calendar_lists_days_and_month_navigation(self) -> None:
+        keyboard = report_dates_keyboard(
+            2026,
+            8,
+            (
+                RegistrationDayStats(
+                    registration_date="2026-08-07", processed=37, total=37
+                ),
+                RegistrationDayStats(
+                    registration_date="2026-08-08", processed=0, total=1
+                ),
+            ),
+            today=date(2026, 8, 9),
+        )
+
+        buttons = [row[0] for row in keyboard.inline_keyboard[:-1]]
+        self.assertEqual(buttons[0].text, "09.08.2026 · 0/0")
+        self.assertEqual(buttons[1].text, "08.08.2026 · 0/1")
+        self.assertEqual(buttons[2].text, "07.08.2026 · 37/37")
+        self.assertEqual(
+            buttons[2].callback_data,
+            f"{CALLBACK_REPORT_DAY_PREFIX}2026-08-07",
+        )
+        previous = keyboard.inline_keyboard[-1][0]
+        self.assertEqual(previous.callback_data, "report:month:2026-07")
+        self.assertLessEqual(len(previous.callback_data.encode("utf-8")), 64)
+
     def test_persistent_keyboard_contains_menu_button(self) -> None:
         keyboard = menu_keyboard()
         self.assertTrue(keyboard.is_persistent)
@@ -448,6 +483,38 @@ class AccessHandlerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReportHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_month_callback_loads_only_sql_aggregates(self) -> None:
+        service, _, clients = make_service()
+        message = make_message()
+        callback = make_callback(
+            message, f"{CALLBACK_REPORT_MONTH_PREFIX}2026-07"
+        )
+
+        await service.report_month_callback(callback)
+
+        callback.answer.assert_awaited_once_with()
+        clients.registration_date_stats.assert_called_once_with(
+            date(2026, 7, 1), date(2026, 7, 31)
+        )
+        clients.list_by_registration_date.assert_not_called()
+        self.assertIn("07.2026", message.answer.await_args.args[0])
+
+    async def test_day_callback_sends_short_report_and_excel(self) -> None:
+        service, _, clients = make_service(clients=(make_client(),))
+        message = make_message()
+        callback = make_callback(
+            message, f"{CALLBACK_REPORT_DAY_PREFIX}2026-08-01"
+        )
+
+        await service.report_day_callback(callback)
+
+        callback.answer.assert_awaited_once_with()
+        clients.list_by_registration_date.assert_called_once_with(
+            date(2026, 8, 1)
+        )
+        message.answer_document.assert_awaited_once()
+        self.assertIn("Телефон:", message.answer.await_args_list[0].args[0])
+
     async def test_manual_report_reads_only_existing_sqlite_rows(self) -> None:
         service, access, clients = make_service(clients=(make_client(),))
         message = make_message(text="/report 2026-08-01")
@@ -459,12 +526,14 @@ class ReportHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tuple(attempts_call), (17,))
         sent = "\n".join(call.args[0] for call in message.answer.await_args_list)
         self.assertIn("ООО Тест &amp; Партнеры", sent)
-        self.assertIn("СБИС — телефоны", sent)
-        self.assertIn("Telegram — телефоны", sent)
+        self.assertIn("Телефон: <code>+7 (000)-000-00-02</code> и еще 2", sent)
+        self.assertIn("Почта: <code>tg@example.test</code> и еще 2", sent)
+        self.assertNotIn("Результат:", sent)
         last_options = message.answer.await_args.kwargs
         self.assertEqual(last_options["parse_mode"], ParseMode.HTML)
-        button = last_options["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.callback_data, "report:xlsx:id:1")
+        message.answer_document.assert_awaited_once()
+        document = message.answer_document.await_args.args[0]
+        self.assertEqual(document.filename, "report_1_2026-08-01.xlsx")
         access.create_next_report_run.assert_called_once()
         self.assertEqual(
             access.create_next_report_run.call_args.kwargs["kind"], "manual"
@@ -477,8 +546,9 @@ class ReportHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         await service.report_command(message)
 
-        self.assertIn("YYYY-MM-DD", message.answer.await_args.args[0])
+        self.assertIn("Выберите дату", message.answer.await_args.args[0])
         clients.list_by_registration_date.assert_not_called()
+        clients.registration_date_stats.assert_called_once()
 
     async def test_excel_uses_same_snapshot_after_client_changes(self) -> None:
         original = make_client()
@@ -825,7 +895,7 @@ class SubscriptionAndAdminTests(unittest.IsolatedAsyncioTestCase):
             "health_available_queries", "34"
         )
 
-    async def test_test_report_requests_date_without_external_calls(self) -> None:
+    async def test_test_report_opens_calendar_without_external_calls(self) -> None:
         service, _, clients = make_service(admin=True)
         message = make_message(1)
         callback = make_callback(message, "admin:test_report", user_id=1)
@@ -836,9 +906,11 @@ class SubscriptionAndAdminTests(unittest.IsolatedAsyncioTestCase):
         await service.admin_test_report_callback(callback, state)
 
         callback.answer.assert_awaited_once_with()
-        state.set_state.assert_awaited_once()
-        self.assertIn("только уже сохраненные", message.answer.await_args.args[0])
+        state.clear.assert_awaited_once()
+        state.set_state.assert_not_awaited()
+        self.assertIn("Выберите дату", message.answer.await_args.args[0])
         clients.list_by_registration_date.assert_not_called()
+        clients.registration_date_stats.assert_called_once()
 
 
 if __name__ == "__main__":

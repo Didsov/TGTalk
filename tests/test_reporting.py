@@ -125,10 +125,12 @@ class HtmlReportTests(unittest.TestCase):
         text = "\n".join(render_report_html(report))
 
         self.assertIn("&lt;Организация &amp; партнёры&gt;", text)
-        self.assertIn("&lt;Иванов&gt;", text)
         self.assertNotIn("<Организация", text)
-        for label in REPORT_SECTION_LABELS.values():
-            self.assertIn(label, text)
+        self.assertIn("Телефон: <code>+7 (999)-000-00-03</code>", text)
+        self.assertIn("и еще 2", text)
+        self.assertNotIn("Результат:", text)
+        self.assertIn(REPORT_SECTION_LABELS[ReportSection.FOUND], text)
+        self.assertNotIn(REPORT_SECTION_LABELS[ReportSection.SKIPPED], text)
 
     def test_splits_only_between_entries_and_observes_limit(self) -> None:
         report = build_client_report(
@@ -166,7 +168,9 @@ class HtmlReportTests(unittest.TestCase):
         chunks = render_report_html(report)
 
         self.assertTrue(all(len(chunk) <= 4096 for chunk in chunks))
-        self.assertEqual(sum("• <b>" in chunk for chunk in chunks), 1)
+        self.assertEqual(
+            sum(chunk.count("Дата регистрации ") for chunk in chunks), 1
+        )
         self.assertIn("…", "".join(chunks))
 
 

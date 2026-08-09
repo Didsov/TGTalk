@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
@@ -161,10 +161,12 @@ def render_report_html(
     if not 256 <= max_length <= TELEGRAM_MESSAGE_LIMIT:
         raise ValueError("max_length должен быть от 256 до 4096")
 
-    summary = ", ".join(
+    summary_parts = tuple(
         f"{REPORT_SECTION_LABELS[section]}: {report.count(section)}"
         for section in REPORT_SECTION_ORDER
+        if report.count(section) > 0
     )
+    summary = ", ".join(summary_parts) if summary_parts else "Организаций: 0"
     blocks = [f"<b>{escape(title)}</b>\n{escape(summary)}"]
 
     for section in REPORT_SECTION_ORDER:
@@ -173,7 +175,9 @@ def render_report_html(
             f"<b>{escape(REPORT_SECTION_LABELS[section])} — "
             f"{len(entries)}</b>"
         )
-        if not entries or section is ReportSection.QUEUED:
+        if not entries:
+            continue
+        if section is ReportSection.QUEUED:
             blocks.append(heading)
             continue
         first_entry = _render_entry_html(entries[0], max_length=max_length)
@@ -272,41 +276,38 @@ def _classify_client(client: NewClient) -> tuple[ReportSection, str | None]:
 
 
 def _render_entry_html(entry: ReportEntry, *, max_length: int) -> str:
+    phones = _merge_contacts(
+        entry.client.telegram_phones,
+        entry.client.personalised_phones,
+        entry.client.sbis_phones,
+    )
+    emails = _merge_contacts(
+        entry.client.telegram_emails,
+        entry.client.personalised_emails,
+        entry.client.sbis_emails,
+    )
     values = (
         entry.client.name,
-        entry.director_name or "—",
-        entry.client.registration_date or "—",
-        STATUS_LABELS[entry.client.status],
-        _contacts_text(entry.client.sbis_phones),
-        _contacts_text(entry.client.sbis_emails),
-        _contacts_text(entry.client.personalised_phones),
-        _contacts_text(entry.client.personalised_emails),
-        _contacts_text(entry.client.telegram_phones),
-        _contacts_text(entry.client.telegram_emails),
-        entry.result_code or "—",
-        entry.error_code or "—",
+        _display_date(entry.client.registration_date),
+        _first_contact_html(phones, formatter=_format_phone),
+        _first_contact_html(emails),
     )
 
     def render(value_limit: int | None) -> str:
-        escaped = tuple(
-            _escaped_value(value, max_length=value_limit) for value in values
-        )
+        name = _escaped_value(values[0], max_length=value_limit)
+        registration_date = escape(values[1])
         return (
-            f"• <b>{escaped[0]}</b>\n"
-            f"ФИО: {escaped[1]}\n"
-            f"Дата регистрации: {escaped[2]}\n"
-            f"Статус: {escaped[3]}\n"
-            f"СБИС — телефоны: {escaped[4]}; почты: {escaped[5]}\n"
-            f"Карточка СБИС — телефоны: {escaped[6]}; почты: {escaped[7]}\n"
-            f"Telegram — телефоны: {escaped[8]}; почты: {escaped[9]}\n"
-            f"Результат: {escaped[10]}; ошибка: {escaped[11]}"
+            f"<b>{name}</b>\n"
+            f"Дата регистрации {registration_date}\n"
+            f"Телефон: {values[2]}\n"
+            f"Почта: {values[3]}"
         )
 
     full = render(None)
     if len(full) <= max_length:
         return full
 
-    largest_value = max(len(value) for value in values)
+    largest_value = len(values[0])
     low, high = 0, largest_value
     fitted: str | None = None
     while low <= high:
@@ -320,6 +321,53 @@ def _render_entry_html(entry: ReportEntry, *, max_length: int) -> str:
     if fitted is None:
         raise ValueError("max_length слишком мал для одного элемента отчёта")
     return fitted
+
+
+def _merge_contacts(*sources: Sequence[str]) -> tuple[str, ...]:
+    """Объединить источники в порядке приоритета без повторов."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for value in source:
+            clean = value.strip()
+            key = clean.casefold()
+            if not clean or key in seen:
+                continue
+            seen.add(key)
+            result.append(clean)
+    return tuple(result)
+
+
+def _first_contact_html(
+    contacts: Sequence[str],
+    *,
+    formatter: Callable[[str], str] | None = None,
+) -> str:
+    if not contacts:
+        return "—"
+    value = formatter(contacts[0]) if formatter is not None else contacts[0]
+    suffix = f" и еще {len(contacts) - 1}" if len(contacts) > 1 else ""
+    return f"<code>{escape(value)}</code>{suffix}"
+
+
+def _format_phone(value: str) -> str:
+    digits = "".join(character for character in value if character.isdigit())
+    if len(digits) == 11 and digits[0] in {"7", "8"}:
+        return (
+            f"+7 ({digits[1:4]})-{digits[4:7]}-"
+            f"{digits[7:9]}-{digits[9:11]}"
+        )
+    return value
+
+
+def _display_date(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        parsed = date.fromisoformat(value[:10])
+    except ValueError:
+        return value
+    return parsed.strftime("%d.%m.%Y")
 
 
 def _pack_blocks(blocks: Sequence[str], *, max_length: int) -> tuple[str, ...]:

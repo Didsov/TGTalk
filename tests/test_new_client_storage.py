@@ -196,6 +196,35 @@ class NewClientStorageTests(unittest.TestCase):
 
         self.assertEqual([client.spp_id for client in selected], [2, 1])
 
+    def test_registration_date_stats_count_processed_and_total(self) -> None:
+        self.storage.save_sbis_list(
+            [
+                sbis_client(
+                    ИдентификаторСПП=1, ДатаРегистрации="2026-08-07"
+                ),
+                sbis_client(
+                    ИдентификаторСПП=2, ДатаРегистрации="2026-08-07"
+                ),
+                sbis_client(
+                    ИдентификаторСПП=3, ДатаРегистрации="2026-08-08"
+                ),
+            ]
+        )
+        self.storage.set_status(1, ProcessingStatus.PROCESSED)
+        self.storage.set_status(2, ProcessingStatus.SKIPPED)
+
+        stats = self.storage.registration_date_stats(
+            "2026-08-01", "2026-08-31"
+        )
+
+        self.assertEqual(
+            [
+                (item.registration_date, item.processed, item.total)
+                for item in stats
+            ],
+            [("2026-08-08", 0, 1), ("2026-08-07", 1, 2)],
+        )
+
     def test_returns_latest_attempts_and_marks_clients_reported(self) -> None:
         self.storage.save_sbis_list(
             [sbis_client(ИдентификаторСПП=1), sbis_client(ИдентификаторСПП=2)]

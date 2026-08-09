@@ -77,6 +77,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sends_daily_report_and_does_not_duplicate_delivery(self) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
 
         first = await send_daily_report(
@@ -96,6 +97,12 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.sent, 1)
         self.assertEqual(second.sent, 0)
         self.assertEqual(bot.send_message.await_count, 1)
+        self.assertEqual(bot.send_document.await_count, 1)
+        text = bot.send_message.await_args.args[1]
+        self.assertIn("Телефон: <code>+7 (999)-111-22-33</code>", text)
+        self.assertNotIn("Результат:", text)
+        document = bot.send_document.await_args.args[1]
+        self.assertTrue(document.data.startswith(b"PK"))
         saved = self.clients.get(1)
         self.assertEqual(saved.report_id, str(first.report_id))
         self.assertIsNotNone(saved.reported_at)
@@ -104,6 +111,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         self.reporting.add_user(102)
         self.reporting.subscribe(102)
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
 
         async def send(chat_id, *args, **kwargs):
             if chat_id == 101:
@@ -131,6 +139,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sends_one_late_update_after_client_changes(self) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         await send_daily_report(
             bot,
@@ -161,6 +170,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_does_not_send_supplement_when_only_timestamp_changed(self) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         await send_daily_report(
             bot,
@@ -195,6 +205,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         await send_daily_report(
             bot,
@@ -225,6 +236,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         await send_daily_report(
             bot,
@@ -252,6 +264,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_client_after_main_report_goes_to_supplement(self) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         main = await send_daily_report(
             bot,
@@ -282,6 +295,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         main = await send_daily_report(
             bot,
@@ -318,6 +332,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=77))
         await send_daily_report(
             bot,
@@ -365,6 +380,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retries_failed_delivery_from_saved_report_snapshot(self) -> None:
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(side_effect=RuntimeError("offline"))
         initial = await send_daily_report(
             bot,
@@ -405,6 +421,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.reporting.ensure_report_deliveries(report_run.id, [101])
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(return_value=Mock(message_id=99))
 
         retries = await retry_failed_report_deliveries(
@@ -428,6 +445,7 @@ class ReportSenderTests(unittest.IsolatedAsyncioTestCase):
             )
             self.clients.set_status(spp_id, ProcessingStatus.PROCESSED)
         bot = Mock()
+        bot.send_document = AsyncMock(return_value=Mock(message_id=78))
         bot.send_message = AsyncMock(
             side_effect=[Mock(message_id=1), RuntimeError("offline")]
         )

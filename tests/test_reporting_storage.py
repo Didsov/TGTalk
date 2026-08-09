@@ -779,6 +779,28 @@ class ReportingStorageTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(saved_message_id, 700)
 
+    def test_delivery_parts_can_append_excel_for_legacy_report(self) -> None:
+        report = self.storage.create_report_run(
+            kind="weekly", cohort_date="2026-08-02"
+        )
+        self.storage.ensure_report_deliveries(report.id, (100,))
+        self.storage.ensure_delivery_parts(report.id, 100, 2)
+        self.storage.mark_delivery_part_sent(report.id, 100, 0)
+
+        self.storage.ensure_delivery_parts(
+            report.id,
+            100,
+            3,
+            allow_single_append=True,
+        )
+
+        self.assertEqual(
+            self.storage.sent_delivery_part_indexes(report.id, 100), {0}
+        )
+        self.assertTrue(
+            self.storage.mark_delivery_part_sent(report.id, 100, 2)
+        )
+
     def test_failed_delivery_can_be_requeued(self) -> None:
         report = self.storage.create_report_run(
             kind="weekly", cohort_date="2026-08-02"

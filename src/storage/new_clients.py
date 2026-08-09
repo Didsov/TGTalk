@@ -73,6 +73,15 @@ class TelegramSearchAttempt:
     created_at: str
 
 
+@dataclass(frozen=True)
+class RegistrationDayStats:
+    """Количество всех и обработанных организаций за календарный день."""
+
+    registration_date: str
+    processed: int
+    total: int
+
+
 class NewClientStorage:
     """Сохраняет реквизиты и контакты новых клиентов без дублей."""
 
@@ -640,6 +649,42 @@ class NewClientStorage:
                 (clean_date,),
             ).fetchall()
             return [self._to_client(connection, row) for row in rows]
+
+    def registration_date_stats(
+        self,
+        date_from: date | str,
+        date_to: date | str,
+    ) -> tuple[RegistrationDayStats, ...]:
+        """Вернуть агрегаты по дням из SQLite без внешних запросов."""
+        clean_from = self._date_text(date_from)
+        clean_to = self._date_text(date_to)
+        if clean_from is None or clean_to is None:  # pragma: no cover
+            raise ValueError("Границы периода обязательны")
+        if clean_from > clean_to:
+            raise ValueError("Начало периода не может быть позже окончания")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT date(registration_date) AS registration_day,
+                       SUM(CASE WHEN status = 'processed' THEN 1 ELSE 0 END)
+                           AS processed_count,
+                       COUNT(*) AS total_count
+                FROM new_clients
+                WHERE registration_date IS NOT NULL
+                  AND date(registration_date) BETWEEN date(?) AND date(?)
+                GROUP BY date(registration_date)
+                ORDER BY registration_day DESC
+                """,
+                (clean_from, clean_to),
+            ).fetchall()
+            return tuple(
+                RegistrationDayStats(
+                    registration_date=str(row["registration_day"]),
+                    processed=int(row["processed_count"]),
+                    total=int(row["total_count"]),
+                )
+                for row in rows
+            )
 
     def latest_attempts_for_clients(
         self,

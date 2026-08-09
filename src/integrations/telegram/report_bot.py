@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from calendar import monthrange
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
@@ -35,11 +36,15 @@ from src.application.reporting import (
 from src.application.health import run_active_health_probes
 from src.config import loadEnvironment, requireSetting
 from src.integrations.telegram.report_sender import (
-    report_download_keyboard,
     report_from_snapshot,
     report_item_from_entry,
 )
-from src.storage.new_clients import STATUS_LABELS, NewClientStorage, ProcessingStatus
+from src.storage.new_clients import (
+    STATUS_LABELS,
+    NewClientStorage,
+    ProcessingStatus,
+    RegistrationDayStats,
+)
 from src.storage.reporting import BootstrapAdminRemovalError, ReportingStorage
 
 
@@ -47,6 +52,8 @@ CALLBACK_SUBSCRIBE = "sub:on"
 CALLBACK_UNSUBSCRIBE = "sub:off"
 CALLBACK_STATUS = "status"
 CALLBACK_REPORT_DATE = "report:ask"
+CALLBACK_REPORT_DAY_PREFIX = "report:date:"
+CALLBACK_REPORT_MONTH_PREFIX = "report:month:"
 CALLBACK_ADMIN_PANEL = "admin:panel"
 CALLBACK_ADMIN_LIST = "admin:list"
 CALLBACK_ADMIN_REPORT_STATUS = "admin:status"
@@ -272,6 +279,65 @@ def health_refresh_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def report_dates_keyboard(
+    year: int,
+    month: int,
+    stats: Iterable[RegistrationDayStats],
+    *,
+    today: date | None = None,
+) -> InlineKeyboardMarkup:
+    """Показать дни месяца и агрегат «обработано/всего»."""
+    current_day = today or date.today()
+    first_day = date(year, month, 1)
+    if first_day > current_day.replace(day=1):
+        raise ValueError("Нельзя показать будущий месяц")
+    totals = {
+        item.registration_date: (item.processed, item.total) for item in stats
+    }
+    last_day = monthrange(year, month)[1]
+    if year == current_day.year and month == current_day.month:
+        last_day = current_day.day
+    rows: list[list[InlineKeyboardButton]] = []
+    for day_number in range(last_day, 0, -1):
+        selected = date(year, month, day_number)
+        processed, total = totals.get(selected.isoformat(), (0, 0))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"{selected.strftime('%d.%m.%Y')} · "
+                        f"{processed}/{total}"
+                    ),
+                    callback_data=(
+                        f"{CALLBACK_REPORT_DAY_PREFIX}{selected.isoformat()}"
+                    ),
+                )
+            ]
+        )
+    previous = _shift_month(year, month, -1)
+    navigation = [
+        InlineKeyboardButton(
+            text=f"← {previous.strftime('%m.%Y')}",
+            callback_data=(
+                f"{CALLBACK_REPORT_MONTH_PREFIX}{previous.strftime('%Y-%m')}"
+            ),
+        )
+    ]
+    next_month = _shift_month(year, month, 1)
+    if next_month <= current_day.replace(day=1):
+        navigation.append(
+            InlineKeyboardButton(
+                text=f"{next_month.strftime('%m.%Y')} →",
+                callback_data=(
+                    f"{CALLBACK_REPORT_MONTH_PREFIX}"
+                    f"{next_month.strftime('%Y-%m')}"
+                ),
+            )
+        )
+    rows.append(navigation)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 class ReportBotService:
     """Обработчики доступа, подписок и ручных отчетов без внешнего поиска."""
 
@@ -346,16 +412,13 @@ class ReportBotService:
         )
 
     async def report_command(self, message: Message) -> None:
-        """Сформировать ручной отчет по аргументу команды /report YYYY-MM-DD."""
+        """Открыть выбор даты или сформировать отчет по необязательному аргументу."""
         user_id = await self._authorized_message(message)
         if user_id is None:
             return
         argument = _command_argument(message.text)
         if argument is None:
-            await message.answer(
-                "Укажите дату: <code>/report YYYY-MM-DD</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            await self._send_report_calendar(message, date.today())
             return
         try:
             target_date = _parse_date(argument)
@@ -365,13 +428,13 @@ class ReportBotService:
         await self._send_html_report(message, target_date)
 
     async def request_report_date(self, message: Message, state: FSMContext) -> None:
-        """Перейти к вводу даты ручного отчета."""
+        """Открыть календарный выбор даты ручного отчета."""
         user_id = await self._authorized_message(message)
         if user_id is None:
             await state.clear()
             return
-        await state.set_state(ReportDateInput.waiting_date)
-        await message.answer("Введите дату отчета в формате YYYY-MM-DD.")
+        await state.clear()
+        await self._send_report_calendar(message, date.today())
 
     async def receive_report_date(self, message: Message, state: FSMContext) -> None:
         """Проверить введенную дату и отправить отчет из SQLite."""
@@ -423,13 +486,42 @@ class ReportBotService:
     async def report_date_callback(
         self, callback: CallbackQuery, state: FSMContext
     ) -> None:
-        """Запросить дату после быстрого ответа callback и проверки доступа."""
+        """Показать текущий месяц после быстрого ответа callback."""
         user_id, message = await self._authorized_callback(callback)
         if user_id is None or message is None:
             await state.clear()
             return
-        await state.set_state(ReportDateInput.waiting_date)
-        await message.answer("Введите дату отчета в формате YYYY-MM-DD.")
+        await state.clear()
+        await self._send_report_calendar(message, date.today())
+
+    async def report_month_callback(self, callback: CallbackQuery) -> None:
+        """Переключить календарь отчетов на выбранный месяц."""
+        user_id, message = await self._authorized_callback(callback)
+        if user_id is None or message is None:
+            return
+        raw_month = (callback.data or "")[len(CALLBACK_REPORT_MONTH_PREFIX) :]
+        try:
+            selected_month = _parse_month(raw_month)
+        except ValueError:
+            await message.answer("Кнопка содержит некорректный месяц.")
+            return
+        if selected_month > date.today().replace(day=1):
+            await message.answer("Будущий месяц пока недоступен.")
+            return
+        await self._send_report_calendar(message, selected_month)
+
+    async def report_day_callback(self, callback: CallbackQuery) -> None:
+        """Сформировать отчет по дню, выбранному inline-кнопкой."""
+        user_id, message = await self._authorized_callback(callback)
+        if user_id is None or message is None:
+            return
+        raw_date = (callback.data or "")[len(CALLBACK_REPORT_DAY_PREFIX) :]
+        try:
+            target_date = _parse_date(raw_date)
+        except ValueError:
+            await message.answer("Кнопка содержит некорректную дату.")
+            return
+        await self._send_html_report(message, target_date)
 
     async def excel_callback(self, callback: CallbackQuery) -> None:
         """Сформировать XLSX из того же неизменяемого снимка, что и HTML."""
@@ -667,16 +759,13 @@ class ReportBotService:
     async def admin_test_report_callback(
         self, callback: CallbackQuery, state: FSMContext
     ) -> None:
-        """Запросить дату тестового отчета без запуска сбора или поиска."""
+        """Открыть календарь тестового отчета без сбора или поиска."""
         actor_id, message = await self._authorized_callback(callback, admin=True)
         if actor_id is None or message is None:
             await state.clear()
             return
-        await state.set_state(ReportDateInput.waiting_date)
-        await message.answer(
-            "Введите дату тестового отчета в формате YYYY-MM-DD. "
-            "Будут использованы только уже сохраненные данные."
-        )
+        await state.clear()
+        await self._send_report_calendar(message, date.today())
 
     async def fallback(self, message: Message) -> None:
         """Безопасно ответить на неизвестный текст или показать ID посетителю."""
@@ -693,17 +782,44 @@ class ReportBotService:
         chunks = render_report_html(
             report, title=f"Отчет за {target_date.strftime('%d.%m.%Y')}"
         )
-        for index, chunk in enumerate(chunks):
-            reply_markup = (
-                report_download_keyboard(report_id)
-                if index == len(chunks) - 1
-                else None
-            )
+        for chunk in chunks:
             await message.answer(
                 chunk,
                 parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
             )
+        document = BufferedInputFile(
+            build_report_excel(report),
+            filename=f"report_{report_id}_{target_date.isoformat()}.xlsx",
+        )
+        await message.answer_document(
+            document,
+            caption=f"Полный отчет за {target_date.strftime('%d.%m.%Y')}",
+        )
+
+    async def _send_report_calendar(
+        self,
+        message: Message,
+        selected_month: date,
+    ) -> None:
+        month_start = selected_month.replace(day=1)
+        month_end = date(
+            month_start.year,
+            month_start.month,
+            monthrange(month_start.year, month_start.month)[1],
+        )
+        stats = self.client_storage.registration_date_stats(
+            month_start, month_end
+        )
+        await message.answer(
+            "Отчет по дате\n"
+            f"{month_start.strftime('%m.%Y')} · обработано/всего\n"
+            "Выберите дату:",
+            reply_markup=report_dates_keyboard(
+                month_start.year,
+                month_start.month,
+                stats,
+            ),
+        )
 
     def _load_report(self, target_date: date) -> ClientReport:
         """Прочитать отчет только из уже собранных таблиц NewClientStorage."""
@@ -1056,6 +1172,14 @@ def create_report_router(service: ReportBotService) -> Router:
         service.report_date_callback, F.data == CALLBACK_REPORT_DATE
     )
     router.callback_query.register(
+        service.report_day_callback,
+        F.data.startswith(CALLBACK_REPORT_DAY_PREFIX),
+    )
+    router.callback_query.register(
+        service.report_month_callback,
+        F.data.startswith(CALLBACK_REPORT_MONTH_PREFIX),
+    )
+    router.callback_query.register(
         service.excel_callback, F.data.startswith(CALLBACK_EXCEL_PREFIX)
     )
     router.callback_query.register(
@@ -1125,6 +1249,18 @@ def _parse_date(value: str) -> date:
         return date.fromisoformat(value.strip())
     except ValueError as error:
         raise ValueError("Дата должна иметь формат YYYY-MM-DD.") from error
+
+
+def _parse_month(value: str) -> date:
+    try:
+        return date.fromisoformat(f"{value.strip()}-01")
+    except ValueError as error:
+        raise ValueError("Месяц должен иметь формат YYYY-MM") from error
+
+
+def _shift_month(year: int, month: int, offset: int) -> date:
+    absolute = year * 12 + month - 1 + offset
+    return date(absolute // 12, absolute % 12 + 1, 1)
 
 
 def _parse_user_id(value: str) -> int:

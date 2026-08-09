@@ -8,11 +8,12 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import uuid4
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.application.reporting import (
     ClientReport,
     ReportEntry,
+    build_report_excel,
     build_client_report,
     load_client_report,
     render_report_html,
@@ -105,6 +106,7 @@ async def send_daily_report(
         reporting_storage,
         report_run.id,
         snapshot_report,
+        cohort_date=target_date,
         title=(
             "Организации, открытые ровно 7 дней назад — "
             f"{target_date.strftime('%d.%m.%Y')}"
@@ -201,6 +203,7 @@ async def send_late_update_reports(
             reporting_storage,
             report_run.id,
             snapshot_report,
+            cohort_date=cohort_date,
             title=(
                 "Дополнение к отчету за "
                 f"{cohort_date.strftime('%d.%m.%Y')}"
@@ -247,6 +250,7 @@ async def retry_failed_report_deliveries(
             reporting_storage,
             report_run.id,
             report,
+            cohort_date=cohort_date,
             title=_stored_report_title(report_run.kind, cohort_date),
             bootstrap_admin_ids=bootstrap_admin_ids,
         )
@@ -268,6 +272,7 @@ async def _dispatch_report(
     report_id: int,
     report: ClientReport,
     *,
+    cohort_date: date,
     title: str,
     bootstrap_admin_ids: tuple[int, ...],
 ) -> tuple[int, int]:
@@ -278,7 +283,6 @@ async def _dispatch_report(
             title=title,
         ),
     )
-    keyboard = report_download_keyboard(report_id)
     claim_token = uuid4().hex
     pending_count = len(
         reporting_storage.list_pending_deliveries(report_id, limit=100_000)
@@ -316,7 +320,8 @@ async def _dispatch_report(
             reporting_storage.ensure_delivery_parts(
                 report_id,
                 delivery.user_id,
-                len(chunks),
+                len(chunks) + 1,
+                allow_single_append=True,
             )
             sent_parts = reporting_storage.sent_delivery_part_indexes(
                 report_id,
@@ -330,12 +335,28 @@ async def _dispatch_report(
                     delivery.user_id,
                     chunk,
                     parse_mode="HTML",
-                    reply_markup=keyboard if index == len(chunks) - 1 else None,
                 )
                 reporting_storage.mark_delivery_part_sent(
                     report_id,
                     delivery.user_id,
                     index,
+                    message_id=getattr(last_message, "message_id", None),
+                )
+            excel_part_index = len(chunks)
+            if excel_part_index not in sent_parts:
+                document = BufferedInputFile(
+                    build_report_excel(report),
+                    filename=f"report_{report_id}_{cohort_date.isoformat()}.xlsx",
+                )
+                last_message = await bot.send_document(
+                    delivery.user_id,
+                    document,
+                    caption="Полный отчет в Excel",
+                )
+                reporting_storage.mark_delivery_part_sent(
+                    report_id,
+                    delivery.user_id,
+                    excel_part_index,
                     message_id=getattr(last_message, "message_id", None),
                 )
             reporting_storage.mark_delivery_sent(
