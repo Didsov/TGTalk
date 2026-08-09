@@ -128,6 +128,18 @@ class PipelineRun:
     error_code: str | None
 
 
+@dataclass(frozen=True)
+class IntegrationHealth:
+    """Последнее безопасное состояние одной внешней интеграции."""
+
+    integration: str
+    status: str
+    checked_at: str
+    last_ok_at: str | None
+    error_code: str | None
+    consecutive_failures: int
+
+
 class ReportingStorage:
     """Управляет доступом к боту, снимками отчетов и их доставкой."""
 
@@ -276,6 +288,20 @@ class ReportingStorage:
                         available_queries IS NULL OR available_queries >= 0
                     )
                 );
+
+                CREATE TABLE IF NOT EXISTS integration_health (
+                    integration TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    last_ok_at TEXT,
+                    error_code TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    CHECK (status IN (
+                        'healthy', 'unauthorized', 'rate_limited',
+                        'unreachable', 'degraded', 'unknown'
+                    )),
+                    CHECK (consecutive_failures >= 0)
+                );
                 """
             )
             self._ensure_report_item_columns(connection)
@@ -288,6 +314,91 @@ class ReportingStorage:
                 )
                 """
             )
+
+    def record_integration_health(
+        self,
+        integration: str,
+        status: str,
+        *,
+        error_code: str | None = None,
+    ) -> IntegrationHealth:
+        """Сохранить результат проверки, не записывая секреты и ответы сервисов."""
+        clean_integration = integration.strip().casefold()
+        if not clean_integration or len(clean_integration) > 50:
+            raise ValueError("Некорректное имя интеграции")
+        allowed_statuses = {
+            "healthy",
+            "unauthorized",
+            "rate_limited",
+            "unreachable",
+            "degraded",
+            "unknown",
+        }
+        if status not in allowed_statuses:
+            raise ValueError("Некорректный статус интеграции")
+        clean_error = None if error_code is None else error_code.strip()[:100]
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            previous = connection.execute(
+                "SELECT * FROM integration_health WHERE integration = ?",
+                (clean_integration,),
+            ).fetchone()
+            failures = (
+                0
+                if status == "healthy"
+                else (0 if previous is None else int(previous["consecutive_failures"]))
+                + 1
+            )
+            last_ok_at = (
+                now
+                if status == "healthy"
+                else None if previous is None else previous["last_ok_at"]
+            )
+            connection.execute(
+                """
+                INSERT INTO integration_health (
+                    integration, status, checked_at, last_ok_at,
+                    error_code, consecutive_failures
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(integration) DO UPDATE SET
+                    status = excluded.status,
+                    checked_at = excluded.checked_at,
+                    last_ok_at = excluded.last_ok_at,
+                    error_code = excluded.error_code,
+                    consecutive_failures = excluded.consecutive_failures
+                """,
+                (
+                    clean_integration,
+                    status,
+                    now,
+                    last_ok_at,
+                    clean_error,
+                    failures,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM integration_health WHERE integration = ?",
+                (clean_integration,),
+            ).fetchone()
+            assert row is not None
+            return self._to_integration_health(row)
+
+    def get_integration_health(self, integration: str) -> IntegrationHealth | None:
+        """Получить последнее состояние одной интеграции."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM integration_health WHERE integration = ?",
+                (integration.strip().casefold(),),
+            ).fetchone()
+            return None if row is None else self._to_integration_health(row)
+
+    def list_integration_health(self) -> tuple[IntegrationHealth, ...]:
+        """Получить состояния всех проверенных интеграций."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM integration_health ORDER BY integration"
+            ).fetchall()
+            return tuple(self._to_integration_health(row) for row in rows)
 
     def is_user_allowed(
         self,
@@ -2024,6 +2135,17 @@ class ReportingStorage:
             ),
             error_stage=row["error_stage"],
             error_code=row["error_code"],
+        )
+
+    @staticmethod
+    def _to_integration_health(row: sqlite3.Row) -> IntegrationHealth:
+        return IntegrationHealth(
+            integration=str(row["integration"]),
+            status=str(row["status"]),
+            checked_at=str(row["checked_at"]),
+            last_ok_at=row["last_ok_at"],
+            error_code=row["error_code"],
+            consecutive_failures=int(row["consecutive_failures"]),
         )
 
     @classmethod

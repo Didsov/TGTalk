@@ -1239,6 +1239,35 @@ class ReportingStorageTests(unittest.TestCase):
         self.assertEqual(failed.error_code, "queries_exhausted")
         self.assertEqual(self.storage.latest_pipeline_run(), failed)
 
+    def test_integration_health_tracks_failures_and_last_success(self) -> None:
+        first = self.storage.record_integration_health("sbis", "healthy")
+        failed = self.storage.record_integration_health(
+            "sbis", "unreachable", error_code="service_unreachable"
+        )
+        failed_again = self.storage.record_integration_health(
+            "sbis", "unreachable", error_code="service_unreachable"
+        )
+
+        self.assertEqual(first.consecutive_failures, 0)
+        self.assertEqual(failed.last_ok_at, first.last_ok_at)
+        self.assertEqual(failed_again.consecutive_failures, 2)
+        self.assertEqual(self.storage.get_integration_health("SBIS"), failed_again)
+
+        recovered = self.storage.record_integration_health("sbis", "healthy")
+        self.assertEqual(recovered.consecutive_failures, 0)
+        self.assertIsNone(recovered.error_code)
+
+    def test_integration_health_lists_only_safe_fields(self) -> None:
+        self.storage.record_integration_health("telethon", "unauthorized")
+        self.storage.record_integration_health("report_bot", "healthy")
+
+        states = self.storage.list_integration_health()
+
+        self.assertEqual(
+            tuple(item.integration for item in states),
+            ("report_bot", "telethon"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from src.application.reporting import (
@@ -30,6 +32,7 @@ from src.application.reporting import (
     build_report_excel,
     render_report_html,
 )
+from src.application.health import run_active_health_probes
 from src.config import loadEnvironment, requireSetting
 from src.integrations.telegram.report_sender import (
     report_download_keyboard,
@@ -48,6 +51,8 @@ CALLBACK_ADMIN_PANEL = "admin:panel"
 CALLBACK_ADMIN_LIST = "admin:list"
 CALLBACK_ADMIN_REPORT_STATUS = "admin:status"
 CALLBACK_ADMIN_PIPELINE_STATUS = "admin:pipeline_status"
+CALLBACK_ADMIN_HEALTH = "admin:health"
+CALLBACK_ADMIN_HEALTH_REFRESH = "admin:health_refresh"
 CALLBACK_ADMIN_TEST_REPORT = "admin:test_report"
 CALLBACK_ADMIN_PREFIX = "admin:"
 CALLBACK_ADMIN_CONFIRM_PREFIX = "admin:confirm:"
@@ -192,6 +197,15 @@ def user_menu(*, subscribed: bool, is_admin: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def menu_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянная кнопка, возвращающая пользователя в главное меню."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Меню")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def admin_menu() -> InlineKeyboardMarkup:
     """Сформировать административную inline-панель."""
     return InlineKeyboardMarkup(
@@ -230,10 +244,30 @@ def admin_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="Состояние интеграций",
+                    callback_data=CALLBACK_ADMIN_HEALTH,
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="Тестовый отчет",
                     callback_data=CALLBACK_ADMIN_TEST_REPORT,
                 ),
             ],
+        ]
+    )
+
+
+def health_refresh_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка явного запуска безопасных проверок интеграций."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Обновить состояние",
+                    callback_data=CALLBACK_ADMIN_HEALTH_REFRESH,
+                )
+            ]
         ]
     )
 
@@ -261,8 +295,16 @@ class ReportBotService:
         await message.answer(
             "Бот отправляет ежедневные отчеты и формирует выборки из уже "
             "собранной базы данных.",
-            reply_markup=self._user_menu(user_id),
+            reply_markup=menu_keyboard(),
         )
+        await message.answer("Главное меню:", reply_markup=self._user_menu(user_id))
+
+    async def menu(self, message: Message) -> None:
+        """Открыть inline-меню по команде или постоянной кнопке."""
+        user_id = await self._authorized_message(message)
+        if user_id is None:
+            return
+        await message.answer("Главное меню:", reply_markup=self._user_menu(user_id))
 
     async def show_id(self, message: Message) -> None:
         """Показать собственный Telegram ID даже неизвестному пользователю."""
@@ -438,6 +480,22 @@ class ReportBotService:
             return
         await message.answer(self._pipeline_status_text())
 
+    async def health_status(self, message: Message) -> None:
+        """Показать администратору последние проверки внешних интеграций."""
+        actor_id = await self._authorized_message(message, admin=True)
+        if actor_id is None:
+            return
+        await message.answer(
+            self._health_status_text(), reply_markup=health_refresh_keyboard()
+        )
+
+    async def health_refresh(self, message: Message) -> None:
+        """Вручную проверить интеграции и бесплатно обновить остаток запросов."""
+        actor_id = await self._authorized_message(message, admin=True)
+        if actor_id is None:
+            return
+        await self._refresh_health(message)
+
     async def admin_command(self, message: Message, state: FSMContext) -> None:
         """Выполнить /add, /remove, /admin_add или /admin_remove."""
         actor_id = await self._authorized_message(message, admin=True)
@@ -572,6 +630,39 @@ class ReportBotService:
         if actor_id is None or message is None:
             return
         await message.answer(self._pipeline_status_text())
+
+    async def health_status_callback(self, callback: CallbackQuery) -> None:
+        """Показать сохраненный health-status после повторной проверки прав."""
+        actor_id, message = await self._authorized_callback(callback, admin=True)
+        if actor_id is None or message is None:
+            return
+        await message.answer(
+            self._health_status_text(), reply_markup=health_refresh_keyboard()
+        )
+
+    async def health_refresh_callback(self, callback: CallbackQuery) -> None:
+        """Запустить ручную проверку после немедленного ответа callback."""
+        actor_id, message = await self._authorized_callback(callback, admin=True)
+        if actor_id is None or message is None:
+            return
+        await self._refresh_health(message)
+
+    async def _refresh_health(self, message: Message) -> None:
+        await message.answer("Проверяю СБИС и Telegram, подождите...")
+        results, available_queries = await run_active_health_probes(message.bot)
+        for result in results:
+            self.access_storage.record_integration_health(
+                result.integration,
+                result.status,
+                error_code=result.error_code,
+            )
+        if available_queries is not None:
+            self.access_storage.set_notification_state(
+                "health_available_queries", str(available_queries)
+            )
+        await message.answer(
+            self._health_status_text(), reply_markup=health_refresh_keyboard()
+        )
 
     async def admin_test_report_callback(
         self, callback: CallbackQuery, state: FSMContext
@@ -822,6 +913,50 @@ class ReportBotService:
             f"Код ошибки: {pipeline_run.error_code or '—'}."
         )
 
+    def _health_status_text(self) -> str:
+        labels = {
+            "healthy": "работает",
+            "unauthorized": "нужна повторная авторизация",
+            "rate_limited": "ограничено по частоте",
+            "unreachable": "недоступно",
+            "degraded": "ошибка проверки",
+            "unknown": "не проверено",
+        }
+        names = {
+            "sbis": "СБИС cookie",
+            "telethon": "Telegram-сессия",
+            "report_bot": "Бот отчетов",
+        }
+        health_by_name = {
+            item.integration: item
+            for item in self.access_storage.list_integration_health()
+        }
+        lines = ["Состояние интеграций:"]
+        for key in ("sbis", "telethon", "report_bot"):
+            item = health_by_name.get(key)
+            if item is None:
+                lines.append(f"{names[key]}: еще не проверялось.")
+                continue
+            lines.append(
+                f"{names[key]}: {labels.get(item.status, item.status)}; "
+                f"проверено {item.checked_at}; "
+                f"последний успех {item.last_ok_at or '—'}; "
+                f"код {item.error_code or '—'}."
+            )
+        balance_state = self.access_storage.get_notification_state(
+            "health_available_queries"
+        )
+        pipeline_run = self.access_storage.latest_pipeline_run()
+        available = (
+            balance_state.value
+            if balance_state is not None
+            else pipeline_run.available_queries
+            if pipeline_run is not None and pipeline_run.available_queries is not None
+            else "не получено"
+        )
+        lines.append(f"Доступно запросов: {available}.")
+        return "\n".join(lines)
+
     def _is_admin(self, user_id: int) -> bool:
         return self.access_storage.is_admin(
             user_id, bootstrap_admin_ids=self.bootstrap_admin_ids
@@ -891,6 +1026,8 @@ def create_report_router(service: ReportBotService) -> Router:
     """Создать изолированный Router с обработчиками отчетного бота."""
     router = Router(name="report_bot")
     router.message.register(service.start, CommandStart())
+    router.message.register(service.menu, Command("menu"))
+    router.message.register(service.menu, F.text.casefold() == "меню")
     router.message.register(service.show_id, Command("id"))
     router.message.register(service.subscribe, Command("subscribe"))
     router.message.register(service.unsubscribe, Command("unsubscribe"))
@@ -898,6 +1035,8 @@ def create_report_router(service: ReportBotService) -> Router:
     router.message.register(service.report_command, Command("report"))
     router.message.register(service.report_status, Command("report_status"))
     router.message.register(service.pipeline_status, Command("pipeline_status"))
+    router.message.register(service.health_status, Command("health"))
+    router.message.register(service.health_refresh, Command("health_refresh"))
     router.message.register(service.admin_panel, Command("admin"))
     router.message.register(
         service.admin_command,
@@ -931,6 +1070,14 @@ def create_report_router(service: ReportBotService) -> Router:
     router.callback_query.register(
         service.pipeline_status_callback,
         F.data == CALLBACK_ADMIN_PIPELINE_STATUS,
+    )
+    router.callback_query.register(
+        service.health_status_callback,
+        F.data == CALLBACK_ADMIN_HEALTH,
+    )
+    router.callback_query.register(
+        service.health_refresh_callback,
+        F.data == CALLBACK_ADMIN_HEALTH_REFRESH,
     )
     router.callback_query.register(
         service.admin_test_report_callback, F.data == CALLBACK_ADMIN_TEST_REPORT

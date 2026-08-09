@@ -12,6 +12,7 @@ from src.storage.new_clients import (
 from src.storage.reporting import (
     AdminAuditEntry,
     BootstrapAdminRemovalError,
+    IntegrationHealth,
     MAX_ATTEMPTS,
     NotificationState,
     PipelineRun,
@@ -27,6 +28,7 @@ __all__ = [
     "NewClient",
     "NewClientStorage",
     "MAX_ATTEMPTS",
+    "IntegrationHealth",
     "NotificationState",
     "Organization",
     "OrganizationStorage",

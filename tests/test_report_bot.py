@@ -24,6 +24,7 @@ from src.integrations.telegram.report_bot import (
     admin_menu,
     create_report_router,
     load_report_bot_settings,
+    menu_keyboard,
     parse_bootstrap_admin_ids,
     user_menu,
 )
@@ -44,6 +45,7 @@ def make_message(
         text=text,
         answer=AsyncMock(),
         answer_document=AsyncMock(),
+        bot=SimpleNamespace(),
     )
 
 
@@ -111,6 +113,8 @@ def make_service(
     access.latest_report_run.return_value = None
     access.latest_deliverable_report_run.return_value = None
     access.latest_pipeline_run.return_value = None
+    access.list_integration_health.return_value = ()
+    access.get_notification_state.return_value = None
     access.delivery_status_counts.return_value = {
         "pending": 0,
         "sent": 0,
@@ -331,6 +335,11 @@ class CliTests(unittest.TestCase):
 
 
 class KeyboardTests(unittest.TestCase):
+    def test_persistent_keyboard_contains_menu_button(self) -> None:
+        keyboard = menu_keyboard()
+        self.assertTrue(keyboard.is_persistent)
+        self.assertEqual(keyboard.keyboard[0][0].text, "Меню")
+
     def test_all_callback_data_fit_telegram_limit(self) -> None:
         keyboards = (
             user_menu(subscribed=False, is_admin=True),
@@ -743,6 +752,78 @@ class SubscriptionAndAdminTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, ["answer", "auth", "storage"])
         self.assertIn("еще не запускался", message.answer.await_args.args[0])
+
+    async def test_health_status_shows_integrations_and_available_queries(self) -> None:
+        service, access, _ = make_service(admin=True)
+        access.list_integration_health.return_value = (
+            SimpleNamespace(
+                integration="sbis",
+                status="healthy",
+                checked_at="2026-08-09T01:00:00+00:00",
+                last_ok_at="2026-08-09T01:00:00+00:00",
+                error_code=None,
+            ),
+            SimpleNamespace(
+                integration="telethon",
+                status="unauthorized",
+                checked_at="2026-08-09T01:01:00+00:00",
+                last_ok_at=None,
+                error_code="session_unauthorized",
+            ),
+        )
+        access.latest_pipeline_run.return_value = SimpleNamespace(
+            available_queries=17
+        )
+        message = make_message(1, text="/health")
+
+        await service.health_status(message)
+
+        text = message.answer.await_args.args[0]
+        self.assertIn("СБИС cookie: работает", text)
+        self.assertIn("Telegram-сессия: нужна повторная авторизация", text)
+        self.assertIn("Бот отчетов: еще не проверялось", text)
+        self.assertIn("Доступно запросов: 17", text)
+
+    async def test_menu_button_rechecks_access(self) -> None:
+        service, access, _ = make_service(allowed=True)
+        message = make_message(100, text="Меню")
+
+        await service.menu(message)
+
+        self.assertIn("Главное меню", message.answer.await_args.args[0])
+        access.is_user_allowed.assert_called_once()
+
+    @patch(
+        "src.integrations.telegram.report_bot.run_active_health_probes",
+        new_callable=AsyncMock,
+    )
+    async def test_health_refresh_saves_current_balance_without_search(
+        self, run_probes: AsyncMock
+    ) -> None:
+        service, access, _ = make_service(admin=True)
+        run_probes.return_value = (
+            (
+                SimpleNamespace(
+                    integration="sbis", status="healthy", error_code=None
+                ),
+                SimpleNamespace(
+                    integration="telethon", status="healthy", error_code=None
+                ),
+                SimpleNamespace(
+                    integration="report_bot", status="healthy", error_code=None
+                ),
+            ),
+            34,
+        )
+        message = make_message(1, text="/health_refresh")
+
+        await service.health_refresh(message)
+
+        run_probes.assert_awaited_once_with(message.bot)
+        self.assertEqual(access.record_integration_health.call_count, 3)
+        access.set_notification_state.assert_called_once_with(
+            "health_available_queries", "34"
+        )
 
     async def test_test_report_requests_date_without_external_calls(self) -> None:
         service, _, clients = make_service(admin=True)
