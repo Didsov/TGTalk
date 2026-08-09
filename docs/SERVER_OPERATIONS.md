@@ -382,6 +382,111 @@ systemd показывает запуск как failed. Детали при э�
 Дополнительное описание статусов находится в
 [`HEALTH_MONITORING.md`](HEALTH_MONITORING.md).
 
+### Изменение времени и параметров запуска
+
+Время ежедневного сбора задается в `inntophone-daily.timer`, а не в service-
+файле. Все следующие команды выполнять под `root`.
+
+Открыть таймер в `nano`:
+
+```bash
+EDITOR=nano systemctl edit --full inntophone-daily.timer
+```
+
+Например, ежедневный запуск в `10:30`:
+
+```ini
+[Timer]
+OnCalendar=*-*-* 10:30:00
+Persistent=true
+Unit=inntophone-daily.service
+```
+
+Сохранить через `Ctrl+O`, `Enter`, `Ctrl+X`, затем применить изменение:
+
+```bash
+systemctl daemon-reload
+systemctl restart inntophone-daily.timer
+systemctl list-timers --all | grep inntophone
+```
+
+Примеры `OnCalendar`:
+
+```ini
+# Каждый день в 07:00
+OnCalendar=*-*-* 07:00:00
+
+# Каждый день в 23:30
+OnCalendar=*-*-* 23:30:00
+
+# Только по будням в 09:00
+OnCalendar=Mon..Fri *-*-* 09:00:00
+```
+
+Проверить выражение и ближайшие срабатывания до редактирования таймера:
+
+```bash
+systemd-analyze calendar '*-*-* 10:30:00'
+```
+
+Расписание использует часовой пояс сервера. Проверить его:
+
+```bash
+timedatectl
+```
+
+Установить Владивосток и пересчитать следующее срабатывание:
+
+```bash
+timedatectl set-timezone Asia/Vladivostok
+systemctl restart inntophone-daily.timer
+```
+
+Количество обрабатываемых клиентов и timeout задаются в service-файле:
+
+```bash
+EDITOR=nano systemctl edit --full inntophone-daily.service
+```
+
+Например, ограничение в 200 клиентов и timeout 45 секунд:
+
+```ini
+ExecStart=/opt/inntophone/.venv/bin/python -m src.cli.daily_pipeline --database /opt/inntophone/data/clients.db --limit 200 --timeout 45
+```
+
+После изменения service-файла:
+
+```bash
+systemctl daemon-reload
+```
+
+Постоянно работающий бот отчетов перезапускать из-за изменения daily service не
+нужно. Новые параметры будут использованы при следующем запуске конвейера.
+
+Частота мониторинга задается в `inntophone-health.timer`:
+
+```bash
+EDITOR=nano systemctl edit --full inntophone-health.timer
+```
+
+Например, проверка раз в час:
+
+```ini
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=inntophone-health.service
+```
+
+Применить и проверить:
+
+```bash
+systemctl daemon-reload
+systemctl restart inntophone-health.timer
+systemctl list-timers --all | grep inntophone
+```
+
 ## 6. Ручное управление
 
 ```bash
