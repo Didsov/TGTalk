@@ -5,13 +5,21 @@ param(
 
     [string]$RemoteUser = "inntophone",
     [string]$RemoteProject = "/opt/inntophone",
-    [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$RepositoryRoot = "",
     [string]$LocalBackupDirectory = "D:\INNtoPhone-Backups",
-    [int]$RemoteKeep = 7,
-    [int]$LocalKeep = 30
+    [int]$RemoteKeep = 3,
+    [int]$LocalKeep = 7
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        throw "The script path could not be determined. Pass -RepositoryRoot explicitly."
+    }
+    $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $scriptPath)
+}
 
 if ($RemoteKeep -lt 1 -or $LocalKeep -lt 1) {
     throw "RemoteKeep and LocalKeep must be greater than zero."
