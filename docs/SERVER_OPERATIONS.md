@@ -166,6 +166,33 @@ cd /opt/inntophone
 Без явного `--date` сбор выполняется за вчерашний день. Перед первым production-
 запуском рекомендуется проверить остаток запросов через `/health_refresh`.
 
+### Дозаполнение UUID и ИНН директора в существующей базе
+
+Сначала получить отсутствующие UUID из `Contractor.ListCompany`:
+
+```bash
+cd /opt/inntophone
+.venv/bin/python -m src.cli.backfill_contractor_uuids \
+  --database /opt/inntophone/data/clients.db
+```
+
+Обход списка прекращается, когда дата регистрации в отсортированном ответе СБИС
+становится старше даты самого старого клиента без UUID в локальной базе.
+
+Затем перечитать карточки без ИНН директора по сохраненной паре
+`spp_id + contractor_uuid`:
+
+```bash
+.venv/bin/python -m src.cli.backfill_director_inn \
+  --database /opt/inntophone/data/clients.db \
+  --limit 1000
+```
+
+Обе команды изменяют SQLite. Перед backfill рекомендуется создать резервную
+копию и убедиться, что `inntophone-daily.service` сейчас не работает. Вторая
+команда выполняет запросы `ContractorCard.Read` и соблюдает их ограничение
+частоты. Существующие `contractor_uuid` и `director_inn` не перезаписываются.
+
 ## 5. Постоянный запуск через systemd
 
 Ручной запуск Python занимает текущий терминал, потому что процесс работает в

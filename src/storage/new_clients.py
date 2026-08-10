@@ -9,6 +9,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from uuid import UUID
 
 
 class ProcessingStatus(StrEnum):
@@ -61,6 +62,7 @@ class NewClient:
     reported_at: str | None = None
     data_revision: int = 0
     reported_revision: int | None = None
+    contractor_uuid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class NewClientStorage:
                     director_middle_name TEXT,
                     legal_address TEXT,
                     director_inn TEXT,
+                    contractor_uuid TEXT,
                     report_id TEXT,
                     reported_at TEXT,
                     data_revision INTEGER NOT NULL DEFAULT 0,
@@ -184,6 +187,7 @@ class NewClientStorage:
             self._ensure_needs_review_column(connection)
             self._ensure_telegram_claim_columns(connection)
             self._ensure_company_card_columns(connection)
+            self._ensure_contractor_uuid_column(connection)
             self._ensure_report_columns(connection)
             self._ensure_report_revision_columns(connection)
             connection.execute(
@@ -208,6 +212,7 @@ class NewClientStorage:
         is_entrepreneur = self._boolean(record.get("Предприниматель"))
         sbis_phones = self._contacts(record.get("Телефон"))
         sbis_emails = self._contacts(record.get("email"))
+        contractor_uuid = self._optional_uuid(record.get("UUID"))
 
         values = (
             spp_id,
@@ -222,6 +227,7 @@ class NewClientStorage:
             self._optional_text(record.get("Директор.Фамилия")),
             self._optional_text(record.get("Директор.Имя")),
             self._optional_text(record.get("Директор.Отчество")),
+            contractor_uuid,
         )
 
         with self._connect() as connection:
@@ -230,8 +236,8 @@ class NewClientStorage:
                 INSERT INTO new_clients (
                     spp_id, name, region, ogrn, inn, kpp, is_entrepreneur,
                     registration_date, liquidation_date, director_last_name,
-                    director_first_name, director_middle_name
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    director_first_name, director_middle_name, contractor_uuid
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(spp_id) DO UPDATE SET
                     name = excluded.name,
                     region = excluded.region,
@@ -244,6 +250,10 @@ class NewClientStorage:
                     director_last_name = excluded.director_last_name,
                     director_first_name = excluded.director_first_name,
                     director_middle_name = excluded.director_middle_name,
+                    contractor_uuid = COALESCE(
+                        excluded.contractor_uuid,
+                        new_clients.contractor_uuid
+                    ),
                     data_revision = new_clients.data_revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
@@ -265,7 +275,12 @@ class NewClientStorage:
         """Сохранить список, полученный пользовательским преобразователем СБИС."""
         return [self.upsert_from_sbis(record) for record in records]
 
-    def upsert_from_company_card(self, card: dict[str, Any]) -> NewClient:
+    def upsert_from_company_card(
+        self,
+        card: dict[str, Any],
+        *,
+        contractor_uuid: str | None = None,
+    ) -> NewClient:
         """Сохранить данные ContractorCard.Read и отдельные personalised-контакты."""
         spp_data = card.get("spp_data")
         extra_data = card.get("extra_data")
@@ -273,6 +288,14 @@ class NewClientStorage:
             raise ValueError("Карточка не содержит spp_data")
         if not isinstance(extra_data, dict):
             raise ValueError("Карточка не содержит extra_data")
+        clean_contractor_uuid = self._optional_uuid(contractor_uuid)
+
+        director_data = spp_data
+        head_data = card.get("head_data")
+        if isinstance(head_data, dict):
+            head_spp_data = head_data.get("spp_data")
+            if isinstance(head_spp_data, dict):
+                director_data = head_spp_data
 
         spp_id = self._positive_int(
             spp_data.get("ИдентификаторСПП", card.get("ИдентификаторСПП"))
@@ -294,16 +317,17 @@ class NewClientStorage:
             int(bool(spp_data.get("Предприниматель"))),
             self._date_text(card.get("ДатаРегистрации")),
             self._date_text(card.get("ДатаЛиквидации")),
-            self._optional_text(spp_data.get("Директор.Фамилия")),
-            self._optional_text(spp_data.get("Директор.Имя")),
-            self._optional_text(spp_data.get("Директор.Отчество")),
+            self._optional_text(director_data.get("Директор.Фамилия")),
+            self._optional_text(director_data.get("Директор.Имя")),
+            self._optional_text(director_data.get("Директор.Отчество")),
             self._optional_text(card.get("АдресЮридический")),
             self._digits(
-                spp_data.get("Директор.ИНН"),
+                director_data.get("Директор.ИНН"),
                 "Директор.ИНН",
                 (10, 12),
             )
-            if spp_data.get("Директор.ИНН") else None,
+            if director_data.get("Директор.ИНН") else None,
+            clean_contractor_uuid,
         )
         with self._connect() as connection:
             connection.execute(
@@ -312,8 +336,8 @@ class NewClientStorage:
                     spp_id, name, region, ogrn, inn, kpp, is_entrepreneur,
                     registration_date, liquidation_date, director_last_name,
                     director_first_name, director_middle_name, legal_address,
-                    director_inn
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    director_inn, contractor_uuid
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(spp_id) DO UPDATE SET
                     name = excluded.name, region = excluded.region,
                     ogrn = excluded.ogrn, inn = excluded.inn, kpp = excluded.kpp,
@@ -325,6 +349,10 @@ class NewClientStorage:
                     director_middle_name = excluded.director_middle_name,
                     legal_address = excluded.legal_address,
                     director_inn = excluded.director_inn,
+                    contractor_uuid = COALESCE(
+                        excluded.contractor_uuid,
+                        new_clients.contractor_uuid
+                    ),
                     data_revision = new_clients.data_revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
@@ -579,6 +607,77 @@ class NewClientStorage:
             if row is None:
                 return None
             return self._to_client(connection, row)
+
+    def list_without_contractor_uuid(self) -> list[NewClient]:
+        """Вернуть клиентов, для которых UUID организации еще не сохранен."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM new_clients
+                WHERE contractor_uuid IS NULL OR trim(contractor_uuid) = ''
+                ORDER BY created_at, spp_id
+                """
+            ).fetchall()
+            return [self._to_client(connection, row) for row in rows]
+
+    def list_without_director_inn(self, limit: int | None = None) -> list[NewClient]:
+        """Вернуть клиентов без ИНН директора, но с UUID для чтения карточки."""
+        if limit is not None:
+            self._validate_processing_limit(limit)
+        query = """
+            SELECT * FROM new_clients
+            WHERE (director_inn IS NULL OR trim(director_inn) = '')
+              AND contractor_uuid IS NOT NULL
+              AND trim(contractor_uuid) != ''
+            ORDER BY created_at, spp_id
+        """
+        parameters: tuple[int, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters = (limit,)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+            return [self._to_client(connection, row) for row in rows]
+
+    def set_contractor_uuid_if_missing(
+        self,
+        spp_id: int,
+        contractor_uuid: str,
+    ) -> bool:
+        """Заполнить отсутствующий UUID, не заменяя уже сохраненное значение."""
+        clean_spp_id = self._positive_int(spp_id)
+        clean_uuid = self._optional_uuid(contractor_uuid)
+        if clean_uuid is None:  # pragma: no cover - обязательный аргумент
+            raise ValueError("UUID организации обязателен")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE new_clients
+                SET contractor_uuid = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE spp_id = ?
+                  AND (contractor_uuid IS NULL OR trim(contractor_uuid) = '')
+                """,
+                (clean_uuid, clean_spp_id),
+            )
+            return cursor.rowcount == 1
+
+    def set_director_inn_if_missing(self, spp_id: int, director_inn: str) -> bool:
+        """Заполнить отсутствующий ИНН директора без перезаписи существующего."""
+        clean_spp_id = self._positive_int(spp_id)
+        clean_inn = self._digits(director_inn, "Директор.ИНН", (10, 12))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE new_clients
+                SET director_inn = ?,
+                    data_revision = data_revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE spp_id = ?
+                  AND (director_inn IS NULL OR trim(director_inn) = '')
+                """,
+                (clean_inn, clean_spp_id),
+            )
+            return cursor.rowcount == 1
 
     def latest_telegram_attempt(
         self,
@@ -993,6 +1092,7 @@ class NewClientStorage:
                 if row["reported_revision"] is None
                 else int(row["reported_revision"])
             ),
+            contractor_uuid=cls._row_optional(row["contractor_uuid"]),
         )
 
     @staticmethod
@@ -1099,6 +1199,17 @@ class NewClientStorage:
         if "director_inn" not in columns:
             connection.execute(
                 "ALTER TABLE new_clients ADD COLUMN director_inn TEXT"
+            )
+
+    @staticmethod
+    def _ensure_contractor_uuid_column(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(new_clients)")
+        }
+        if "contractor_uuid" not in columns:
+            connection.execute(
+                "ALTER TABLE new_clients ADD COLUMN contractor_uuid TEXT"
             )
 
     @staticmethod
@@ -1224,6 +1335,16 @@ class NewClientStorage:
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
         return cls._digits(value, field_name, (length,))
+
+    @classmethod
+    def _optional_uuid(cls, value: Any) -> str | None:
+        clean_value = cls._optional_text(value)
+        if clean_value is None:
+            return None
+        try:
+            return str(UUID(clean_value))
+        except ValueError as error:
+            raise ValueError("UUID организации имеет неверный формат") from error
 
     @staticmethod
     def _boolean(value: Any) -> bool:

@@ -10,6 +10,7 @@ from src.integrations.sbis.companies import (
     _get_company_page,
     _save_companies,
     get_company_card,
+    get_company_uuids,
     get_open_companies_by_date,
 )
 
@@ -261,6 +262,103 @@ class CompanyCardTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class CompanyUuidLookupTests(unittest.IsolatedAsyncioTestCase):
+    UUID = "40bc4f3e-92a4-11f1-81b4-057c77c03283"
+
+    async def test_stops_before_page_rows_older_than_oldest_target(self) -> None:
+        pages = [
+            (
+                [
+                    {
+                        "ИдентификаторСПП": 1,
+                        "UUID": self.UUID,
+                        "ДатаРегистрации": "2026-08-09",
+                    },
+                    {
+                        "ИдентификаторСПП": 2,
+                        "UUID": self.UUID,
+                        "ДатаРегистрации": "2026-08-08",
+                    },
+                ],
+                True,
+            ),
+            (
+                [
+                    {
+                        "ИдентификаторСПП": 999,
+                        "UUID": self.UUID,
+                        "ДатаРегистрации": "2026-08-06",
+                    }
+                ],
+                True,
+            ),
+        ]
+        session = Mock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        with (
+            patch("src.integrations.sbis.companies.loadEnvironment"),
+            patch(
+                "src.integrations.sbis.companies.requireSetting",
+                return_value="sid",
+            ),
+            patch(
+                "src.integrations.sbis.companies.aiohttp.ClientSession",
+                return_value=session,
+            ),
+            patch(
+                "src.integrations.sbis.companies._get_company_page",
+                new=AsyncMock(side_effect=pages),
+            ) as get_page,
+        ):
+            result = await get_company_uuids(
+                [1, 2, 3],
+                oldest_registration_date=date(2026, 8, 7),
+            )
+
+        self.assertEqual(result, {1: self.UUID, 2: self.UUID})
+        self.assertEqual(get_page.await_count, 2)
+
+    async def test_stops_immediately_after_all_targets_are_found(self) -> None:
+        session = Mock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        get_page = AsyncMock(
+            return_value=(
+                [
+                    {
+                        "ИдентификаторСПП": 1,
+                        "UUID": self.UUID,
+                        "ДатаРегистрации": "2026-08-09",
+                    }
+                ],
+                True,
+            )
+        )
+        with (
+            patch("src.integrations.sbis.companies.loadEnvironment"),
+            patch(
+                "src.integrations.sbis.companies.requireSetting",
+                return_value="sid",
+            ),
+            patch(
+                "src.integrations.sbis.companies.aiohttp.ClientSession",
+                return_value=session,
+            ),
+            patch(
+                "src.integrations.sbis.companies._get_company_page",
+                new=get_page,
+            ),
+        ):
+            result = await get_company_uuids(
+                [1],
+                oldest_registration_date=date(2026, 8, 7),
+            )
+
+        self.assertEqual(result, {1: self.UUID})
+        get_page.assert_awaited_once()
+
+
 class OpenCompaniesByDateTests(unittest.IsolatedAsyncioTestCase):
     UUID = "40bc4f3e-92a4-11f1-81b4-057c77c03283"
 
@@ -340,8 +438,12 @@ class OpenCompaniesByDateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_page.await_args_list[1].args[2], 1)
         self.assertEqual(get_card.await_count, 2)
         self.assertEqual(self.storage.upsert_from_company_card.call_count, 2)
-        self.storage.upsert_from_company_card.assert_any_call({"ID": 2})
-        self.storage.upsert_from_company_card.assert_any_call({"ID": 3})
+        self.storage.upsert_from_company_card.assert_any_call(
+            {"ID": 2}, contractor_uuid=self.UUID
+        )
+        self.storage.upsert_from_company_card.assert_any_call(
+            {"ID": 3}, contractor_uuid=self.UUID
+        )
 
     async def test_stops_naturally_when_result_n_is_false(self) -> None:
         session = self._session()
@@ -369,7 +471,9 @@ class OpenCompaniesByDateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([record["ID"] for record in result], [1])
         get_page.assert_awaited_once()
-        self.storage.upsert_from_company_card.assert_called_once_with({"ID": 1})
+        self.storage.upsert_from_company_card.assert_called_once_with(
+            {"ID": 1}, contractor_uuid=self.UUID
+        )
 
     async def test_uses_today_when_date_is_omitted(self) -> None:
         today = date.today()
@@ -395,7 +499,9 @@ class OpenCompaniesByDateTests(unittest.IsolatedAsyncioTestCase):
             result = await get_open_companies_by_date()
 
         self.assertEqual(result, [card])
-        self.storage.upsert_from_company_card.assert_called_once_with(card)
+        self.storage.upsert_from_company_card.assert_called_once_with(
+            card, contractor_uuid=self.UUID
+        )
 
     async def test_pauses_one_minute_after_twenty_cards(self) -> None:
         records = [self._record(index, "2026-08-07") for index in range(1, 22)]
@@ -455,7 +561,12 @@ class OpenCompaniesByDateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, [{"ID": 2}])
         get_card.assert_awaited_once_with(2, self.UUID)
-        self.storage.upsert_from_company_card.assert_called_once_with({"ID": 2})
+        self.storage.upsert_from_company_card.assert_called_once_with(
+            {"ID": 2}, contractor_uuid=self.UUID
+        )
+        self.storage.set_contractor_uuid_if_missing.assert_called_once_with(
+            1, self.UUID
+        )
         self.assertTrue(
             any(
                 "уже есть в БД; пропущена" in str(call.args[0])

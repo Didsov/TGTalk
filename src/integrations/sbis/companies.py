@@ -297,6 +297,72 @@ async def get_company_card(
     return _sbis_record_to_dict(result)
 
 
+async def get_company_uuids(
+    spp_ids: list[int],
+    *,
+    oldest_registration_date: date,
+) -> dict[int, str]:
+    """Найти UUID до достижения даты самого старого целевого клиента."""
+    targets = {
+        spp_id
+        for spp_id in spp_ids
+        if isinstance(spp_id, int) and not isinstance(spp_id, bool) and spp_id > 0
+    }
+    if len(targets) != len(spp_ids):
+        raise ValueError(
+            "spp_ids должен содержать уникальные положительные целые числа"
+        )
+    if not isinstance(oldest_registration_date, date):
+        raise TypeError("oldest_registration_date должен быть календарной датой")
+    if not targets:
+        return {}
+
+    loadEnvironment()
+    browser_cookie = requireSetting("SBIS_BROWSER_COOKIE")
+    timeout = aiohttp.ClientTimeout(total=60)
+    found: dict[int, str] = {}
+    page_number = 0
+    previous_date: date | None = None
+    reached_older_date = False
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while targets - found.keys() and not reached_older_date:
+            records, has_more = await _get_company_page(
+                session, browser_cookie, page_number
+            )
+            print(
+                f"Страница {page_number + 1} получена: "
+                f"{len(records)} организаций"
+            )
+            for record in records:
+                registration_date = _calendar_date(record.get("ДатаРегистрации"))
+                if previous_date is not None and registration_date > previous_date:
+                    raise SbisApiError(
+                        "Contractor.ListCompany нарушил сортировку "
+                        "ДатаРегистрации от новых к старым"
+                    )
+                previous_date = registration_date
+                if registration_date < oldest_registration_date:
+                    reached_older_date = True
+                    break
+
+                spp_id = record.get("ИдентификаторСПП")
+                if spp_id not in targets:
+                    continue
+                contractor_uuid = record.get("UUID")
+                if not isinstance(contractor_uuid, str) or not contractor_uuid.strip():
+                    continue
+                try:
+                    found[spp_id] = str(UUID(contractor_uuid.strip()))
+                except ValueError:
+                    continue
+            if reached_older_date or not has_more:
+                break
+            page_number += 1
+
+    return found
+
+
 def _retry_after_seconds(response: Any, attempt: int) -> float:
     """После HTTP 429 ждать не меньше полного минутного окна лимита."""
     headers = getattr(response, "headers", None)
@@ -391,13 +457,14 @@ async def get_open_companies_by_date(
         contractor_uuid = record.get("UUID")
         if not isinstance(spp_id, int) or isinstance(spp_id, bool):
             raise SbisApiError("Запись списка не содержит ИдентификаторСПП")
+        if not isinstance(contractor_uuid, str) or not contractor_uuid.strip():
+            raise SbisApiError("Запись списка не содержит UUID")
         if storage.get(spp_id) is not None:
+            storage.set_contractor_uuid_if_missing(spp_id, contractor_uuid)
             print(
                 f"Карточка {index}/{len(selected)} уже есть в БД; пропущена"
             )
             continue
-        if not isinstance(contractor_uuid, str) or not contractor_uuid.strip():
-            raise SbisApiError("Запись списка не содержит UUID")
         if requested_cards > 0 and requested_cards % COMPANY_CARD_RATE_LIMIT == 0:
             print(
                 f"Получено {requested_cards} новых карточек; пауза "
@@ -409,14 +476,15 @@ async def get_open_companies_by_date(
         card = await get_company_card(spp_id, contractor_uuid)
         requested_cards += 1
         cards.append(card)
-        storage.upsert_from_company_card(card)
-        spp_data = card.get("spp_data")
-        director_collected = isinstance(spp_data, dict) and any(
-            spp_data.get(field)
-            for field in (
-                "Директор.Фамилия",
-                "Директор.Имя",
-                "Директор.Отчество",
+        saved_client = storage.upsert_from_company_card(
+            card,
+            contractor_uuid=contractor_uuid,
+        )
+        director_collected = any(
+            (
+                saved_client.director_last_name,
+                saved_client.director_first_name,
+                saved_client.director_middle_name,
             )
         )
         print(

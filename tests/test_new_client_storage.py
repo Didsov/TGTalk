@@ -102,6 +102,77 @@ class NewClientStorageTests(unittest.TestCase):
         self.assertEqual(saved.sbis_phones, ())
         self.assertEqual(saved.telegram_phones, ())
 
+    def test_company_card_prefers_director_from_head_data(self) -> None:
+        card = company_card(
+            head_data={
+                "spp_data": {
+                    "Директор.Фамилия": "Петров",
+                    "Директор.Имя": "Пётр",
+                    "Директор.Отчество": "Петрович",
+                    "Директор.ИНН": "7715964180",
+                }
+            }
+        )
+
+        saved = self.storage.upsert_from_company_card(card)
+
+        self.assertEqual(saved.director_last_name, "Петров")
+        self.assertEqual(saved.director_first_name, "Пётр")
+        self.assertEqual(saved.director_middle_name, "Петрович")
+        self.assertEqual(saved.director_inn, "7715964180")
+
+    def test_company_card_uses_root_spp_data_without_head_data(self) -> None:
+        saved = self.storage.upsert_from_company_card(company_card())
+
+        self.assertEqual(saved.director_last_name, "Иванов")
+        self.assertEqual(saved.director_first_name, "Иван")
+        self.assertEqual(saved.director_middle_name, "Иванович")
+        self.assertEqual(saved.director_inn, "500100732259")
+
+    def test_company_card_saves_contractor_uuid(self) -> None:
+        contractor_uuid = "40bc4f3e-92a4-11f1-81b4-057c77c03283"
+
+        saved = self.storage.upsert_from_company_card(
+            company_card(),
+            contractor_uuid=contractor_uuid,
+        )
+
+        self.assertEqual(saved.contractor_uuid, contractor_uuid)
+
+    def test_uuid_backfill_does_not_replace_existing_value(self) -> None:
+        original_uuid = "40bc4f3e-92a4-11f1-81b4-057c77c03283"
+        another_uuid = "4ef36ad8-b640-4d88-b038-ef456183521b"
+        self.storage.upsert_from_company_card(
+            company_card(), contractor_uuid=original_uuid
+        )
+
+        updated = self.storage.set_contractor_uuid_if_missing(
+            30852759, another_uuid
+        )
+
+        self.assertFalse(updated)
+        self.assertEqual(self.storage.get(30852759).contractor_uuid, original_uuid)
+
+    def test_director_inn_backfill_updates_only_empty_value(self) -> None:
+        card = company_card()
+        card["spp_data"] = dict(card["spp_data"])
+        card["spp_data"].pop("Директор.ИНН")
+        self.storage.upsert_from_company_card(
+            card,
+            contractor_uuid="40bc4f3e-92a4-11f1-81b4-057c77c03283",
+        )
+
+        first_update = self.storage.set_director_inn_if_missing(
+            30852759, "500100732259"
+        )
+        second_update = self.storage.set_director_inn_if_missing(
+            30852759, "7715964180"
+        )
+
+        self.assertTrue(first_update)
+        self.assertFalse(second_update)
+        self.assertEqual(self.storage.get(30852759).director_inn, "500100732259")
+
     def test_repeat_company_card_import_preserves_telegram_state(self) -> None:
         self.storage.upsert_from_company_card(company_card())
         self.storage.replace_telegram_contacts(30852759, phones=["+79991112233"])
