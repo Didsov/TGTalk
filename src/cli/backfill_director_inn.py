@@ -43,8 +43,8 @@ def _positive_int(value: str) -> int:
 def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Перечитать карточки без director_inn по spp_id и contractor_uuid "
-            "и заполнить найденный ИНН директора."
+            "Перечитать карточки без director_inn или director_last_name по "
+            "spp_id и contractor_uuid и дополнить данные директора."
         )
     )
     parser.add_argument(
@@ -62,15 +62,20 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _director_inn(card: dict[str, Any]) -> Any:
+def _director_fields(card: dict[str, Any]) -> dict[str, Any]:
     spp_data = card.get("spp_data")
     if not isinstance(spp_data, dict):
-        return None
+        return {}
     director_data = spp_data
     head_data = card.get("head_data")
     if isinstance(head_data, dict) and isinstance(head_data.get("spp_data"), dict):
         director_data = head_data["spp_data"]
-    return director_data.get("Директор.ИНН")
+    return {
+        "last_name": director_data.get("Директор.Фамилия"),
+        "first_name": director_data.get("Директор.Имя"),
+        "middle_name": director_data.get("Директор.Отчество"),
+        "director_inn": director_data.get("Директор.ИНН"),
+    }
 
 
 async def run_backfill(
@@ -91,11 +96,17 @@ async def run_backfill(
         await asyncio.sleep(COMPANY_CARD_REQUEST_DELAY_SECONDS)
         try:
             card = await get_company_card(client.spp_id, client.contractor_uuid or "")
-            director_inn = _director_inn(card)
-            if director_inn is None or not str(director_inn).strip():
+            director_fields = _director_fields(card)
+            if not any(
+                value is not None and str(value).strip()
+                for value in director_fields.values()
+            ):
                 not_found += 1
                 continue
-            if storage.set_director_inn_if_missing(client.spp_id, str(director_inn)):
+            if storage.set_director_fields_if_missing(
+                client.spp_id,
+                **director_fields,
+            ):
                 updated += 1
         except Exception:
             # Один некорректный ответ или сетевой сбой не останавливает всю пачку.
@@ -110,9 +121,9 @@ async def run_backfill(
 
 
 def print_summary(result: DirectorInnBackfillResult) -> None:
-    print(f"Выбрано карточек без ИНН директора: {result.selected}.")
-    print(f"ИНН директора записано: {result.updated}.")
-    print(f"ИНН директора не найдено: {result.not_found}.")
+    print(f"Выбрано карточек без ИНН или фамилии директора: {result.selected}.")
+    print(f"Карточек с дополненными данными директора: {result.updated}.")
+    print(f"Данные директора не найдены: {result.not_found}.")
     print(f"Ошибок чтения или валидации: {result.failed}.")
 
 

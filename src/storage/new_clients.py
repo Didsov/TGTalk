@@ -621,12 +621,16 @@ class NewClientStorage:
             return [self._to_client(connection, row) for row in rows]
 
     def list_without_director_inn(self, limit: int | None = None) -> list[NewClient]:
-        """Вернуть клиентов без ИНН директора, но с UUID для чтения карточки."""
+        """Вернуть клиентов без ИНН или фамилии директора, но с UUID."""
         if limit is not None:
             self._validate_processing_limit(limit)
         query = """
             SELECT * FROM new_clients
-            WHERE (director_inn IS NULL OR trim(director_inn) = '')
+            WHERE (
+                    director_inn IS NULL OR trim(director_inn) = ''
+                    OR director_last_name IS NULL
+                    OR trim(director_last_name) = ''
+                  )
               AND contractor_uuid IS NOT NULL
               AND trim(contractor_uuid) != ''
             ORDER BY created_at, spp_id
@@ -663,19 +667,62 @@ class NewClientStorage:
 
     def set_director_inn_if_missing(self, spp_id: int, director_inn: str) -> bool:
         """Заполнить отсутствующий ИНН директора без перезаписи существующего."""
+        return self.set_director_fields_if_missing(
+            spp_id,
+            director_inn=director_inn,
+        )
+
+    def set_director_fields_if_missing(
+        self,
+        spp_id: int,
+        *,
+        last_name: str | None = None,
+        first_name: str | None = None,
+        middle_name: str | None = None,
+        director_inn: str | None = None,
+    ) -> bool:
+        """Дозаполнить пустые поля директора, не заменяя сохраненные значения."""
         clean_spp_id = self._positive_int(spp_id)
-        clean_inn = self._digits(director_inn, "Директор.ИНН", (10, 12))
+        clean_last_name = self._optional_text(last_name)
+        clean_first_name = self._optional_text(first_name)
+        clean_middle_name = self._optional_text(middle_name)
+        clean_inn = (
+            self._digits(director_inn, "Директор.ИНН", (10, 12))
+            if self._optional_text(director_inn) is not None
+            else None
+        )
+        supplied = (
+            ("director_last_name", clean_last_name),
+            ("director_first_name", clean_first_name),
+            ("director_middle_name", clean_middle_name),
+            ("director_inn", clean_inn),
+        )
+        available = [(column, value) for column, value in supplied if value]
+        if not available:
+            return False
+
+        assignments = ", ".join(
+            f"{column} = CASE "
+            f"WHEN {column} IS NULL OR trim({column}) = '' THEN ? "
+            f"ELSE {column} END"
+            for column, _ in available
+        )
+        missing_conditions = " OR ".join(
+            f"{column} IS NULL OR trim({column}) = ''"
+            for column, _ in available
+        )
+        parameters = tuple(value for _, value in available) + (clean_spp_id,)
         with self._connect() as connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE new_clients
-                SET director_inn = ?,
+                SET {assignments},
                     data_revision = data_revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE spp_id = ?
-                  AND (director_inn IS NULL OR trim(director_inn) = '')
+                  AND ({missing_conditions})
                 """,
-                (clean_inn, clean_spp_id),
+                parameters,
             )
             return cursor.rowcount == 1
 

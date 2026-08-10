@@ -173,6 +173,44 @@ class NewClientStorageTests(unittest.TestCase):
         self.assertFalse(second_update)
         self.assertEqual(self.storage.get(30852759).director_inn, "500100732259")
 
+    def test_director_backfill_fills_missing_names_without_overwrite(self) -> None:
+        card = company_card()
+        card["spp_data"] = dict(card["spp_data"])
+        card["spp_data"].pop("Директор.Имя")
+        card["spp_data"].pop("Директор.Отчество")
+        card["spp_data"].pop("Директор.ИНН")
+        self.storage.upsert_from_company_card(card)
+
+        updated = self.storage.set_director_fields_if_missing(
+            30852759,
+            last_name="Петров",
+            first_name="Пётр",
+            middle_name="Петрович",
+            director_inn="500100732259",
+        )
+
+        saved = self.storage.get(30852759)
+        self.assertTrue(updated)
+        self.assertEqual(saved.director_last_name, "Иванов")
+        self.assertEqual(saved.director_first_name, "Пётр")
+        self.assertEqual(saved.director_middle_name, "Петрович")
+        self.assertEqual(saved.director_inn, "500100732259")
+
+    def test_director_backfill_selects_missing_last_name_with_existing_inn(self) -> None:
+        card = company_card()
+        card["spp_data"] = dict(card["spp_data"])
+        card["spp_data"].pop("Директор.Фамилия")
+        self.storage.upsert_from_company_card(
+            card,
+            contractor_uuid="40bc4f3e-92a4-11f1-81b4-057c77c03283",
+        )
+
+        selected = self.storage.list_without_director_inn()
+
+        self.assertEqual([client.spp_id for client in selected], [30852759])
+        self.assertEqual(selected[0].director_inn, "500100732259")
+        self.assertIsNone(selected[0].director_last_name)
+
     def test_repeat_company_card_import_preserves_telegram_state(self) -> None:
         self.storage.upsert_from_company_card(company_card())
         self.storage.replace_telegram_contacts(30852759, phones=["+79991112233"])

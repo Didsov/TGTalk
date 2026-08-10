@@ -17,13 +17,26 @@ class DirectorInnBackfillTests(unittest.IsolatedAsyncioTestCase):
             storage.initialize()
             card = company_card()
             card["spp_data"] = dict(card["spp_data"])
-            card["spp_data"].pop("Директор.ИНН")
+            for field in (
+                "Директор.Фамилия",
+                "Директор.Имя",
+                "Директор.Отчество",
+                "Директор.ИНН",
+            ):
+                card["spp_data"].pop(field)
             contractor_uuid = "40bc4f3e-92a4-11f1-81b4-057c77c03283"
             storage.upsert_from_company_card(
                 card, contractor_uuid=contractor_uuid
             )
             response = company_card(
-                head_data={"spp_data": {"Директор.ИНН": "500100732259"}}
+                head_data={
+                    "spp_data": {
+                        "Директор.Фамилия": "Петров",
+                        "Директор.Имя": "Пётр",
+                        "Директор.Отчество": "Петрович",
+                        "Директор.ИНН": "500100732259",
+                    }
+                }
             )
 
             with (
@@ -42,4 +55,8 @@ class DirectorInnBackfillTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.updated, 1)
             self.assertEqual(result.not_found, 0)
             self.assertEqual(result.failed, 0)
-            self.assertEqual(storage.get(30852759).director_inn, "500100732259")
+            saved = storage.get(30852759)
+            self.assertEqual(saved.director_last_name, "Петров")
+            self.assertEqual(saved.director_first_name, "Пётр")
+            self.assertEqual(saved.director_middle_name, "Петрович")
+            self.assertEqual(saved.director_inn, "500100732259")
